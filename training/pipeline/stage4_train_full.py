@@ -1817,6 +1817,21 @@ def train_one_epoch(
                 'g_dec': f"{dec_moe_gn:.2e}"
             }
             postfix.update(ch_post)
+            # Attach semantic fusion residual gate (scale and grad)
+            try:
+                _dec_core = getattr(decoder, 'module', decoder)
+                _sf = getattr(_dec_core, 'semantic_fusion', None)
+                if _sf is not None and hasattr(_sf, 'residual_logit'):
+                    with torch.no_grad():
+                        _rscale = torch.sigmoid(_sf.residual_logit.detach()).item()
+                    _g_res = None
+                    if _sf.residual_logit.grad is not None:
+                        _g_res = float(_sf.residual_logit.grad.detach().abs().item())
+                    postfix['rscale'] = f"{_rscale:.3f}"
+                    if _g_res is not None:
+                        postfix['g_res'] = f"{_g_res:.2e}"
+            except Exception:
+                pass
             # Attach wave debug info
             try:
                 postfix['wsrc'] = str(getattr(train_one_epoch, '_feat_source', 'base'))
@@ -1838,6 +1853,19 @@ def train_one_epoch(
                 f"bal={float((balance_weight_adjusted * balance).item()):.4f}",    # 调整后的MoE平衡损失
                 f"rout={float((router_weight_adjusted * router).item()):.4f}",     # 调整后的路由损失
             ]
+            # Append residual gate state and gradient if available
+            try:
+                _dec_core = getattr(decoder, 'module', decoder)
+                _sf = getattr(_dec_core, 'semantic_fusion', None)
+                if _sf is not None and hasattr(_sf, 'residual_logit'):
+                    with torch.no_grad():
+                        _rscale = torch.sigmoid(_sf.residual_logit.detach()).item()
+                    parts.append(f"rscale={_rscale:.3f}")
+                    if _sf.residual_logit.grad is not None:
+                        _g_res = float(_sf.residual_logit.grad.detach().abs().item())
+                        parts.append(f"g_res={_g_res:.2e}")
+            except Exception:
+                pass
             # Append present channel keys only
             if snr_mean is not None: parts.append(f"SNR={snr_mean:.1f}dB")
             if ber_mean is not None: parts.append(f"BER={ber_mean:.2e}")
