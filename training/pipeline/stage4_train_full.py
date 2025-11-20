@@ -877,8 +877,9 @@ def train_one_epoch(
                     wav_ = None
                 return feats_, wav_
 
-            # 检查是否使用语义增强解码器
-            use_semantic_decoder = hasattr(decoder, 'get_semantic_info')
+            # 检查是否使用语义增强解码器（兼容DDP包裹）
+            dec_core = getattr(decoder, 'module', decoder)
+            use_semantic_decoder = hasattr(dec_core, 'get_semantic_info')
 
             if use_semantic_decoder:
                 # 语义增强模式：使用no_sync避免第一次调用的梯度同步冲突
@@ -1105,7 +1106,8 @@ def train_one_epoch(
                                 # 20→16蒸馏特征（若存在）
                                 distill_feat = decoder_outputs.get('acoustic_semantic_distill', None)
 
-                                sem_dec_loss, _sem_metrics = decoder.compute_semantic_loss(
+                                # 调用底层模块以兼容DDP
+                                sem_dec_loss, _sem_metrics = dec_core.compute_semantic_loss(
                                     semantic_features,
                                     ssl_feats,
                                     loss_type=sem_loss_type,
