@@ -1368,6 +1368,8 @@ def train_one_epoch(
             except Exception:
                 pass
 
+            # 不额外合并语义正则分量（波形/蒸馏）到跨模态项，保持原语义项口径
+
             loss = (
                 wave_w * wave_loss           # 波形质量损失
                 + acoustic_w * acoustic_loss # 自适应权重的声学损失

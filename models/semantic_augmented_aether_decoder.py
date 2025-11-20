@@ -805,7 +805,7 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         wave_semantic_weight: float = 0.3,
         # 20维→16维蒸馏参数
         acoustic_semantic_distill: Optional[torch.Tensor] = None,
-        distill_weight: float = 0.5
+        distill_weight: float = 0.5,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """计算语义对齐损失（插件式）"""
         if not self.enable_semantic_augmentation or self.semantic_processor is None:
@@ -853,6 +853,7 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                               device=ssl_semantic_rec.device)
                 )
 
+                # 计入总损失
                 total_loss = total_loss + wave_semantic_weight * wave_semantic_loss
                 total_metrics['wave_semantic_loss'] = wave_semantic_loss.item()
                 total_metrics['wave_semantic_weight'] = wave_semantic_weight
@@ -870,7 +871,6 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 torch.ones(acoustic_semantic_distill.size(0) * acoustic_semantic_distill.size(1),
                           device=acoustic_semantic_distill.device)
             )
-
             total_loss = total_loss + distill_weight * distill_loss
             total_metrics['acoustic_semantic_distill_loss'] = distill_loss.item()
             total_metrics['distill_weight'] = distill_weight
