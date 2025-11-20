@@ -2704,6 +2704,18 @@ def main() -> int:
         # Use DistributedDataParallel for multi-GPU/multi-node training
         if is_main_process():
             safe_print(f"✅ Using DistributedDataParallel on {world_size} processes")
+
+        # Fix for semantic augmentation: remove duplicate parameter references
+        def fix_parameter_sharing(model):
+            """Remove duplicate parameter references that cause DDP issues"""
+            if hasattr(model, 'fargan_core') and hasattr(model, 'synth'):
+                if hasattr(model.synth, 'fargan_core') and model.fargan_core is model.synth.fargan_core:
+                    # Remove the duplicate reference
+                    delattr(model, 'fargan_core')
+                    safe_print("✅ Fixed duplicate fargan_core reference for DDP compatibility")
+
+        fix_parameter_sharing(decoder)
+
         # Use find_unused_parameters=True to handle dynamic graph with unused parameters
         encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
