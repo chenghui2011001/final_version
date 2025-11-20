@@ -11,6 +11,7 @@ regularisation terms.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 import os
@@ -880,18 +881,19 @@ def train_one_epoch(
             use_semantic_decoder = hasattr(decoder, 'get_semantic_info')
 
             if use_semantic_decoder:
-                # 语义增强模式：直接在后面的分支中处理，这里只做基础前向用于兼容性
-                if revival_active:
-                    try:
-                        from torch.amp import autocast as _ab_autocast
-                        with _ab_autocast('cuda', enabled=False):
-                            out = decoder(z.float(), dec_csi, return_wave=False)  # 不需要波形，减少计算
-                    except Exception:
-                        from torch.amp import autocast as _ab_autocast
-                        with _ab_autocast('cuda', enabled=False):
-                            out = decoder(z.float(), dec_csi, return_wave=False)
-                else:
-                    out = decoder(z, dec_csi, return_wave=False)
+                # 语义增强模式：使用no_sync避免第一次调用的梯度同步冲突
+                with (decoder.no_sync() if hasattr(decoder, 'no_sync') else contextlib.nullcontext()):
+                    if revival_active:
+                        try:
+                            from torch.amp import autocast as _ab_autocast
+                            with _ab_autocast('cuda', enabled=False):
+                                out = decoder(z.float(), dec_csi, return_wave=False)  # 不需要波形，减少计算
+                        except Exception:
+                            from torch.amp import autocast as _ab_autocast
+                            with _ab_autocast('cuda', enabled=False):
+                                out = decoder(z.float(), dec_csi, return_wave=False)
+                    else:
+                        out = decoder(z, dec_csi, return_wave=False)
 
                 # 暂时从基础解码器获取特征，后面会被融合特征替换
                 feats, wav = _normalize_decoder_output(out)
