@@ -7,11 +7,14 @@
 !/utils/
 
 # Inside whitelisted dirs: ignore all by default, re-allow .py
-models/*
+models/**
+!models/**/
 !models/**/*.py
-training/*
+training/**
+!training/**/
 !training/**/*.py
-utils/*
+utils/**
+!utils/**/
 !utils/**/*.py
 
 # Python build/cache
