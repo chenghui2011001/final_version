@@ -2704,12 +2704,9 @@ def main() -> int:
         # Use DistributedDataParallel for multi-GPU/multi-node training
         if is_main_process():
             safe_print(f"✅ Using DistributedDataParallel on {world_size} processes")
-        encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank)
-        decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank)
-
-        # Fix for parameter sharing issue: set static graph to avoid "marked ready twice" error
-        encoder._set_static_graph()
-        decoder._set_static_graph()
+        # Use find_unused_parameters=True to handle dynamic graph with unused parameters
+        encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     elif args.data_parallel and device.type == 'cuda' and torch.cuda.device_count() > 1:
         # Use simple DataParallel for single-node, multi-GPU training
         safe_print(f"✅ Using DataParallel on {torch.cuda.device_count()} GPUs")
