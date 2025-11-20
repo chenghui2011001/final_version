@@ -23,6 +23,9 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 import soundfile as sf
 import numpy as np
+from torch.nn.parallel import DataParallel, DistributedDataParallel
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 # Ensure project root is importable when running as a script
 _THIS_DIR = os.path.dirname(__file__)
@@ -61,6 +64,53 @@ except Exception:
     from training.pipeline.stages import StageConfig, get_stage_config  # script mode fallback
     from training.pipeline.wave_loss import fargan_wave_losses
 from tqdm.auto import tqdm
+
+# --------------------------
+# Distributed training utilities
+# --------------------------
+
+def setup_distributed():
+    """Initialize distributed training if using multiple processes"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # Multi-node or multi-GPU distributed training
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+
+        # Initialize process group
+        dist.init_process_group(
+            backend='nccl' if torch.cuda.is_available() else 'gloo',
+            rank=rank,
+            world_size=world_size
+        )
+
+        # Set device for this process
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+        return True, rank, world_size, local_rank
+    else:
+        # Single node training
+        return False, 0, 1, 0
+
+def cleanup_distributed():
+    """Clean up distributed training"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process():
+    """Check if this is the main process (rank 0)"""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def reduce_tensor(tensor, world_size):
+    """Reduce tensor across all processes for averaging"""
+    if not dist.is_initialized():
+        return tensor
+
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    rt /= world_size
+    return rt
 
 # --------------------------
 # Stage3-style inspection utils
@@ -187,6 +237,9 @@ def _print_semantic_stats_16(sem_pred: torch.Tensor, sem_tgt: Optional[torch.Ten
 
 def safe_print(msg: str, flush: bool = False) -> None:
     """Stage3-style safe printer that cooperates with tqdm progress bars."""
+    # Only print from main process in distributed training
+    if not is_main_process():
+        return
     try:
         tqdm.write(str(msg))
     except Exception:
@@ -1843,11 +1896,14 @@ def train_one_epoch(
         if save_every_steps and (save_every_steps > 0) and out_dir is not None:
             try:
                 if ((step + 1) % int(save_every_steps)) == 0:
+                    # Unwrap DP/DDP modules for clean state_dict keys
+                    enc_sd = encoder.module.state_dict() if hasattr(encoder, 'module') else encoder.state_dict()
+                    dec_sd = decoder.module.state_dict() if hasattr(decoder, 'module') else decoder.state_dict()
                     ckpt = {
                         'epoch': int(epoch_id),
                         'step': int(step + 1),
-                        'encoder_state_dict': encoder.state_dict(),
-                        'decoder_state_dict': decoder.state_dict(),
+                        'encoder_state_dict': enc_sd,
+                        'decoder_state_dict': dec_sd,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'loss': float(loss.item()),
                     }
@@ -1881,6 +1937,12 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", type=str, default="checkpoints_stage4")
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--data-parallel", action="store_true",
+                        help="Use nn.DataParallel to utilize multiple GPUs (simple dual-GPU support)")
+    parser.add_argument("--distributed", action="store_true",
+                        help="Use DistributedDataParallel for multi-GPU/multi-node training (more efficient than DataParallel)")
+    parser.add_argument("--local-rank", type=int, default=-1,
+                        help="Local rank for distributed training (usually set by torch.distributed.launch)")
     parser.add_argument("--mixed-precision", action="store_true",
                         help="Use mixed precision training for acceleration")
     parser.add_argument("--amp-dtype", type=str, default="auto", choices=["auto", "fp16", "bf16"],
@@ -2134,12 +2196,30 @@ def main() -> int:
     except Exception:
         pass
 
-    device = torch.device(
-        "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (args.device if args.device != "auto" else "cpu")
-    )
+    # Initialize distributed training if requested
+    distributed_training, rank, world_size, local_rank = setup_distributed()
+
+    # Override local_rank if provided in args (for backward compatibility)
+    if args.local_rank != -1:
+        local_rank = args.local_rank
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+
+    # Determine device
+    if distributed_training:
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(
+            "cuda" if (args.device == "auto" and torch.cuda.is_available()) else (args.device if args.device != "auto" else "cpu")
+        )
 
     out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Wait for main process to create directory
+    if distributed_training:
+        dist.barrier()
 
     # JSCC-focused run summary
     safe_print("=" * 60)
@@ -2178,6 +2258,22 @@ def main() -> int:
                 print(f"   Combined mix ratio set to: {dataset.mix_ratio.tolist()}")
             except Exception:
                 print("⚠️  Invalid --mix-ratio format; expected 'a,b,c,d'. Using defaults.")
+
+        # Update combined data loader for distributed training
+        if distributed_training:
+            # Create distributed sampler for multi-GPU training
+            train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+
+            # Recreate DataLoader with distributed sampler
+            from torch.utils.data import DataLoader
+            train_loader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                sampler=train_sampler,
+                num_workers=max(1, int(args.num_workers)),
+                pin_memory=True,
+                drop_last=True
+            )
     else:
         # Fallback: single unified dataset via features/pcm
         if not args.features or not args.pcm:
@@ -2199,6 +2295,23 @@ def main() -> int:
             features_file=args.features,
             audio_file=args.pcm,
             stride_frames=args.stride_frames,
+        )
+
+    # Update data loader for distributed training
+    train_sampler = None
+    if distributed_training:
+        # Create distributed sampler for multi-GPU training
+        train_sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+
+        # Recreate DataLoader with distributed sampler
+        from torch.utils.data import DataLoader
+        train_loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            num_workers=max(1, int(args.num_workers)),
+            pin_memory=True,
+            drop_last=True
         )
 
     # --- Infer MoE topology from Stage3 checkpoint if not provided ---
@@ -2517,7 +2630,8 @@ def main() -> int:
     # Build param groups with FiLM-specific LR/WD and per-module multipliers
     def split_film_params(module: nn.Module):
         film, nonfilm = [], []
-        for n, p in module.named_parameters():
+        actual = module.module if hasattr(module, 'module') else module
+        for n, p in actual.named_parameters():
             if not p.requires_grad:
                 continue
             if 'film' in n.lower():
@@ -2531,7 +2645,8 @@ def main() -> int:
 
     # Further split non-Film params into MoE/Wave/Dec-MoE groups
     enc_moe, enc_rest = [], []
-    for n, p in encoder.named_parameters():
+    enc_actual = encoder.module if hasattr(encoder, 'module') else encoder
+    for n, p in enc_actual.named_parameters():
         if not p.requires_grad or ('film' in n.lower()):
             continue
         if '.moe.' in n:
@@ -2540,7 +2655,8 @@ def main() -> int:
             enc_rest.append(p)
 
     dec_wave, dec_moe_params, dec_rest = [], [], []
-    for n, p in decoder.named_parameters():
+    dec_actual = decoder.module if hasattr(decoder, 'module') else decoder
+    for n, p in dec_actual.named_parameters():
         if not p.requires_grad or ('film' in n.lower()):
             continue
         if n.startswith('fargan_core.') or n.startswith('period_estimator.'):
@@ -2582,6 +2698,19 @@ def main() -> int:
         f"lr: base={lr:g} film_x={args.film_lr_mult} moe_x={getattr(args,'moe_lr_mult',1.0)} "
         f"decWave_x={getattr(args,'dec_wave_lr_mult',1.0)} decMoe_x={getattr(args,'dec_moe_lr_mult',1.0)} wd_film={args.film_wd}"
     )
+
+    # Multi-GPU setup: support both DataParallel and DistributedDataParallel
+    if distributed_training:
+        # Use DistributedDataParallel for multi-GPU/multi-node training
+        if is_main_process():
+            safe_print(f"✅ Using DistributedDataParallel on {world_size} processes")
+        encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank)
+        decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank)
+    elif args.data_parallel and device.type == 'cuda' and torch.cuda.device_count() > 1:
+        # Use simple DataParallel for single-node, multi-GPU training
+        safe_print(f"✅ Using DataParallel on {torch.cuda.device_count()} GPUs")
+        encoder = DataParallel(encoder)
+        decoder = DataParallel(decoder)
 
     best = float("inf")
     global_step = 0
@@ -2640,6 +2769,10 @@ def main() -> int:
         print(f"Warning: Mixed precision requested but device is {device.type}, disabling")
 
     for epoch in range(start_epoch, args.epochs + 1):
+        # Set epoch for distributed sampler (important for shuffling)
+        if distributed_training and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Update FiLM schedules (encoder + decoder.refiner if available)
         try:
             # Unconditionally set encoder FiLM schedule knobs (AETHEREncoder uses getattr fallback otherwise)
@@ -2817,20 +2950,34 @@ def main() -> int:
         setattr(train_one_epoch, 'snr_ramp_steps', int(args.snr_ramp_steps))
         setattr(train_one_epoch, 'snr_window_db', float(args.snr_window_db))
         global_step += metrics.get("steps", 0)
-        safe_print(f"Epoch {epoch}/{args.epochs} loss={metrics['loss']:.6f}")
 
-        if metrics["loss"] < best:
-            best = metrics["loss"]
-            torch.save(
-                {
-                    "encoder_state_dict": encoder.state_dict(),
-                    "decoder_state_dict": decoder.state_dict(),
-                    "epoch": epoch,
-                    "loss": best,
-                },
-                out_dir / "stage4_best.pth",
-            )
-            safe_print(f"Saved best Stage4 checkpoint: {out_dir / 'stage4_best.pth'}")
+        # Average loss across all processes for distributed training
+        epoch_loss = metrics["loss"]
+        if distributed_training:
+            loss_tensor = torch.tensor(epoch_loss, device=device)
+            loss_tensor = reduce_tensor(loss_tensor, world_size)
+            epoch_loss = loss_tensor.item()
+
+        if is_main_process():
+            safe_print(f"Epoch {epoch}/{args.epochs} loss={epoch_loss:.6f}")
+
+        if epoch_loss < best:
+            best = epoch_loss
+            # Only save checkpoints on main process
+            if is_main_process():
+                enc_sd = encoder.module.state_dict() if hasattr(encoder, 'module') else encoder.state_dict()
+                dec_sd = decoder.module.state_dict() if hasattr(decoder, 'module') else decoder.state_dict()
+                torch.save({
+                "encoder_state_dict": enc_sd,
+                "decoder_state_dict": dec_sd,
+                "epoch": epoch,
+                "loss": best,
+                }, out_dir / "stage4_best.pth")
+                safe_print(f"Saved best Stage4 checkpoint: {out_dir / 'stage4_best.pth'}")
+
+    # Clean up distributed training
+    if distributed_training:
+        cleanup_distributed()
 
     return 0
 
