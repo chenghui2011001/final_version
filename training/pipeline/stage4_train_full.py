@@ -2705,14 +2705,28 @@ def main() -> int:
         if is_main_process():
             safe_print(f"✅ Using DistributedDataParallel on {world_size} processes")
 
-        # Fix for semantic augmentation: remove duplicate parameter references
+        # Fix for semantic augmentation: prevent duplicate parameter references
         def fix_parameter_sharing(model):
-            """Remove duplicate parameter references that cause DDP issues"""
-            if hasattr(model, 'fargan_core') and hasattr(model, 'synth'):
-                if hasattr(model.synth, 'fargan_core') and model.fargan_core is model.synth.fargan_core:
-                    # Remove the duplicate reference
-                    delattr(model, 'fargan_core')
-                    safe_print("✅ Fixed duplicate fargan_core reference for DDP compatibility")
+            """Prevent duplicate parameter references that cause DDP issues"""
+            if hasattr(model, '_expose_fargan_components'):
+                # Replace the _expose_fargan_components method to prevent duplicate references
+                original_expose = getattr(model, '_expose_fargan_components', None)
+
+                def safe_expose_fargan_components():
+                    """Safe version that doesn't create duplicate references"""
+                    # Only expose if fargan_core doesn't already exist
+                    if not hasattr(model, 'fargan_core'):
+                        if original_expose:
+                            original_expose()
+                    else:
+                        # Remove any duplicate reference created
+                        if hasattr(model, 'synth') and hasattr(model.synth, 'fargan_core'):
+                            if hasattr(model, 'fargan_core') and model.fargan_core is model.synth.fargan_core:
+                                delattr(model, 'fargan_core')
+
+                # Replace the method
+                setattr(model, '_expose_fargan_components', safe_expose_fargan_components)
+                safe_print("✅ Fixed semantic augmentation parameter sharing for DDP compatibility")
 
         fix_parameter_sharing(decoder)
 
