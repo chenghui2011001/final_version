@@ -1,0 +1,24 @@
+# Ignore everything at root except whitelisted dirs and metadata
+/*
+!/.gitignore
+!/README.md
+!/models/
+!/training/
+!/utils/
+
+# Inside whitelisted dirs: ignore all by default, re-allow .py
+models/*
+!models/**/*.py
+training/*
+!training/**/*.py
+utils/*
+!utils/**/*.py
+
+# Python build/cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.dll
