@@ -1288,7 +1288,9 @@ def train_one_epoch(
             if stats_iv > 0 and (step % stats_iv == 0):
                 # Prefer raw 36-d features (pre-fusion) for 36-d stats; fallback to current feats
                 try:
-                    dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
+                    # Probe-only forward for stats: avoid building autograd graph
+                    with torch.no_grad():
+                        dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
                 except Exception:
                     dh_probe = None
 

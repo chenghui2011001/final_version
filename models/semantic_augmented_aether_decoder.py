@@ -525,17 +525,25 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         else:
             csi_dict = csi_dict_or_csi
 
-        # 1. 完全复用父类AETHERDecoder的前向传播
-        if return_wave:
-            features, wave = super().forward(z, csi_dict, return_wave=True, target_len=target_len, **kwargs)
-        else:
-            features = super().forward(z, csi_dict, return_wave=False, **kwargs)
-            wave = None
+        # 1. 复用父类AETHERDecoder的特征前向传播
+        #    注意：当需要语义增强并且返回波形时，避免在父类中生成波形，
+        #    以免在同一iteration内对FARGAN调用两次导致DDP梯度重复标记。
+        features = super().forward(z, csi_dict, return_wave=False, **kwargs)
+        wave = None
 
         # 2. 如果不需要语义输出，直接返回原始结果（完全兼容）
         if not enable_semantic_output or not self.enable_semantic_augmentation:
+            # 关闭语义增强时，如需返回波形，再调用父类生成波形（只在此路径生成一次）。
             if return_wave:
-                return features, wave
+                try:
+                    features_parent, wave_parent = super().forward(
+                        z, csi_dict, return_wave=True, target_len=target_len, **kwargs
+                    )
+                    # 以父类返回的特征为准，保持与原实现一致
+                    return features_parent, wave_parent
+                except Exception:
+                    # 回退：如果父类波形生成失败，仅返回特征
+                    return features, wave
             else:
                 return features
 
@@ -575,6 +583,7 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 # 确保enhanced_wave不为None
                 if enhanced_wave is None:
                     print(f"[WARNING] Enhanced wave synthesis returned None, using original wave")
+                    # 不再提前生成原始波形，这里保持为None，调用方自行判空
                     enhanced_wave = wave
             except Exception as e:
                 print(f"[WARNING] Enhanced wave synthesis failed: {e}, fallback to original wave")
@@ -606,7 +615,7 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         if return_wave:
             if enable_semantic_output and enhanced_wave is not None:
                 outputs['wave'] = enhanced_wave     # 使用融合后特征合成的波形
-                outputs['wave_original'] = wave     # 保留原始波形用于对比
+                outputs['wave_original'] = wave     # 可能为None：未生成原始波形
             else:
                 outputs['wave'] = wave
 
