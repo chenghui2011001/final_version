@@ -3372,16 +3372,24 @@ def main() -> int:
             find_unused_parameters=True
         )
 
-        # 🔥 DDP包装SSL Teacher以确保多GPU训练的一致性
+        # 🔥 DDP包装SSL Teacher（仅当有可训练参数时）
         if ssl_teacher is not None:
-            ssl_teacher = DistributedDataParallel(
-                ssl_teacher,
-                device_ids=[local_rank],
-                output_device=local_rank,
-                find_unused_parameters=True
-            )
-            # 更新train_one_epoch中的引用
-            setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
+            # 检查SSL Teacher是否有需要梯度的参数
+            has_trainable_params = any(p.requires_grad for p in ssl_teacher.parameters())
+            if has_trainable_params:
+                ssl_teacher = DistributedDataParallel(
+                    ssl_teacher,
+                    device_ids=[local_rank],
+                    output_device=local_rank,
+                    find_unused_parameters=True
+                )
+                # 更新train_one_epoch中的引用
+                setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
+            # 如果没有可训练参数，SSL Teacher在所有GPU上保持同步，无需DDP包装
+            # 🔧 确保所有进程能正确使用SSL Teacher（即使没有DDP包装）
+            if distributed_training:
+                # 在分布式环境下显式同步SSL Teacher状态
+                dist.barrier()  # 确保所有进程都完成SSL Teacher初始化
 
         # Skip static graph when using find_unused_parameters=True to avoid conflicts
     elif args.data_parallel and device.type == 'cuda' and torch.cuda.device_count() > 1:
@@ -3390,11 +3398,15 @@ def main() -> int:
         encoder = DataParallel(encoder)
         decoder = DataParallel(decoder)
 
-        # 🔥 DataParallel包装SSL Teacher以确保多GPU训练的一致性
+        # 🔥 DataParallel包装SSL Teacher（仅当有可训练参数时）
         if ssl_teacher is not None:
-            ssl_teacher = DataParallel(ssl_teacher)
-            # 更新train_one_epoch中的引用
-            setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
+            # 检查SSL Teacher是否有需要梯度的参数
+            has_trainable_params = any(p.requires_grad for p in ssl_teacher.parameters())
+            if has_trainable_params:
+                ssl_teacher = DataParallel(ssl_teacher)
+                # 更新train_one_epoch中的引用
+                setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
+            # 如果没有可训练参数，SSL Teacher在所有GPU上保持同步，无需DataParallel包装
 
     best = float("inf")
     global_step = 0
