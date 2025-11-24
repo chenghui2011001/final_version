@@ -134,55 +134,6 @@ class SemanticFeatureExtractor(nn.Module):
         # HuBERT/WavLM typically use 20ms frame shift at 16kHz
         return 50.0
 
-    def _normalize_audio_input(self, audio: torch.Tensor) -> torch.Tensor:
-        """Robustly normalize incoming audio to [B, T] float32 on self.device.
-
-        Accepts common forms:
-        - [T]
-        - [B, T]
-        - [B, 1, T]
-        - [B, 1, 1, T] (e.g., squeezed twice)
-        - [B, C, T] (C>1): collapse channels by mean
-        - [B, C1, C2, T] where C1 or C2 is 1: squeeze singleton dims
-        """
-        x = audio
-        try:
-            # Move first, then cast
-            x = x.to(self.device)
-        except Exception:
-            pass
-        # Ensure dtype
-        x = x.float()
-
-        # Squeeze excessive dims while preserving [B, T] semantics
-        if x.dim() == 1:
-            x = x.unsqueeze(0)  # [T] -> [1, T]
-        elif x.dim() == 4:
-            # Typical case: [B, 1, 1, T] or [B, 1, C2, T]
-            B, C1, C2, T = x.shape
-            if C1 == 1 and C2 == 1:
-                x = x.view(B, T)
-            else:
-                # Collapse channel dims by mean
-                x = x.mean(dim=(1, 2))  # -> [B, T]
-        elif x.dim() == 3:
-            # [B, C, T]
-            B, C, T = x.shape
-            if C == 1:
-                x = x.squeeze(1)  # -> [B, T]
-            else:
-                x = x.mean(dim=1)  # mixdown multi-channel -> [B, T]
-        elif x.dim() == 2:
-            # already [B, T]
-            pass
-        else:
-            # Fallback: flatten all but last dim if possible
-            if x.numel() > 0:
-                T = x.shape[-1]
-                B = int(x.numel() // T)
-                x = x.reshape(B, T)
-        return x.contiguous()
-
     @torch.no_grad()
     def extract_lowrate_semantic(self, audio: torch.Tensor) -> torch.Tensor:
         """
@@ -194,8 +145,9 @@ class SemanticFeatureExtractor(nn.Module):
         Returns:
             semantic_low: [B, T_semantic, 16] Low-rate semantic features
         """
-        # Ensure audio is in correct format (robust squeezing/mixdown)
-        audio = self._normalize_audio_input(audio)
+        # Ensure audio is in correct format
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)  # [T] -> [1, T]
 
         # Extract SSL features with error handling
         try:
@@ -269,15 +221,13 @@ class SemanticFeatureExtractor(nn.Module):
         Returns:
             semantic_features: [B, target_frames, 16] FARGAN-aligned semantic features
         """
-        # Normalize input first for both extraction and frame counting
-        audio_norm = self._normalize_audio_input(audio)
         # Extract low-rate semantic features
-        semantic_low = self.extract_lowrate_semantic(audio_norm)  # [B, T_semantic, 16]
+        semantic_low = self.extract_lowrate_semantic(audio)  # [B, T_semantic, 16]
 
         # Determine target frames if not provided
         if target_frames is None:
             # Estimate based on audio length and FARGAN frame rate
-            T_audio = audio_norm.size(-1)
+            T_audio = audio.size(-1)
             target_frames = int(T_audio * self.fargan_frame_rate / self.sample_rate)
 
         # Broadcast to FARGAN frame rate

@@ -93,6 +93,80 @@ class Stage5Trainer:
         print(f"  Model parameters: {self.model.get_model_info()['total_parameters']:,}")
         print(f"  Trainable parameters: {self.model.get_model_info()['trainable_parameters']:,}")
 
+        # 冻结状态一次性开关（A. 冻结调度一次性执行 + 显式解冻）
+        # 注意：仅在首次需要时触发requires_grad切换，阈值跨越时显式解冻。
+        self._froze = {"dec": False, "film": False, "moe": False}
+
+    @staticmethod
+    def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+        for p in module.parameters():
+            p.requires_grad = flag
+
+    def apply_freeze_once(self, global_step: int) -> None:
+        """一次性应用冻结/解冻，避免每步重复设置requires_grad。
+
+        - decoder: 在 steps < freeze_decoder_steps 期间冻结，越阈值显式解冻
+        - film   : 同上（encoder.film + decoder.refiner.film）
+        - moe    : 同上（encoder.moe）
+        修改任何组件的训练态后，标记_optimizer_needs_update以便重建优化器。
+        """
+        changed = False
+        cfg = self.config
+
+        # Decoder 冻结/解冻
+        freeze_dec_steps = int(cfg.get('freeze_decoder_steps', 0) or 0)
+        if freeze_dec_steps > 0 and hasattr(self.model, 'decoder'):
+            if (not self._froze["dec"]) and (global_step < freeze_dec_steps):
+                self._set_requires_grad(self.model.decoder, False)
+                self._froze["dec"] = True
+                changed = True
+            elif self._froze["dec"] and (global_step >= freeze_dec_steps):
+                self._set_requires_grad(self.model.decoder, True)
+                self._froze["dec"] = False
+                changed = True
+
+        # FiLM（编码端+解码端refiner内的FiLM）冻结/解冻
+        freeze_film_steps = int(cfg.get('freeze_film_steps', 0) or 0)
+        if freeze_film_steps > 0:
+            enc_film = getattr(getattr(self.model, 'encoder', None), 'film', None)
+            dec_film = None
+            if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'refiner'):
+                dec_film = getattr(self.model.decoder.refiner, 'film', None)
+
+            # 冻结
+            if (not self._froze["film"]) and (global_step < freeze_film_steps):
+                if enc_film is not None:
+                    self._set_requires_grad(enc_film, False)
+                if dec_film is not None:
+                    self._set_requires_grad(dec_film, False)
+                self._froze["film"] = True
+                changed = True
+            # 解冻
+            elif self._froze["film"] and (global_step >= freeze_film_steps):
+                if enc_film is not None:
+                    self._set_requires_grad(enc_film, True)
+                if dec_film is not None:
+                    self._set_requires_grad(dec_film, True)
+                self._froze["film"] = False
+                changed = True
+
+        # MoE 冻结/解冻（编码端）
+        freeze_moe_steps = int(cfg.get('freeze_moe_steps', 0) or 0)
+        if freeze_moe_steps > 0:
+            enc_moe = getattr(getattr(self.model, 'encoder', None), 'moe', None)
+            if (not self._froze["moe"]) and (global_step < freeze_moe_steps) and (enc_moe is not None):
+                self._set_requires_grad(enc_moe, False)
+                self._froze["moe"] = True
+                changed = True
+            elif self._froze["moe"] and (global_step >= freeze_moe_steps) and (enc_moe is not None):
+                self._set_requires_grad(enc_moe, True)
+                self._froze["moe"] = False
+                changed = True
+
+        if changed:
+            # 通知训练循环重新构建优化器参数组
+            setattr(self.model, '_optimizer_needs_update', True)
+
     def create_model(self) -> AETHERStage5Model:
         """创建Stage5模型并加载Stage4权重，参照stage4_train_full.py模式"""
         model = create_stage5_model(self.config)
@@ -407,6 +481,12 @@ class Stage5Trainer:
             # 先递增global_step，然后更新训练阶段
             self.global_step += 1
 
+            # A. 一次性冻结/解冻（避免每步重复requires_grad切换）
+            try:
+                self.apply_freeze_once(self.global_step)
+            except Exception:
+                pass
+
             # 更新训练阶段（渐进式解冻）
             if self.global_step % 100 == 0:
                 print(f"[Training Script] About to call update_training_phase at step {self.global_step}")
@@ -596,6 +676,53 @@ class Stage5Trainer:
                             f"[Feat0] mean={f0.get('mean', 0):.3f} std={f0.get('std', 0):.3f} "
                             f"min={f0.get('min', 0):.3f} max={f0.get('max', 0):.3f}"
                         )
+                    # C. FiLM可观测NaN/钳制统计（编码端/解码端）
+                    try:
+                        enc_film_stats = getattr(getattr(self.model, 'encoder', None), '_last_film_stats', None)
+                        dec_film_stats = None
+                        if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'refiner') and hasattr(self.model.decoder.refiner, 'get_film_stats'):
+                            dec_film_stats = self.model.decoder.refiner.get_film_stats()
+                        if isinstance(enc_film_stats, dict) and enc_film_stats:
+                            pbar.write(
+                                f"[FiLM/enc] nan_a={enc_film_stats.get('nan_count_a',0)} nan_b={enc_film_stats.get('nan_count_b',0)} "
+                                f"clamp_s(lo,hi)=({enc_film_stats.get('clamp_scale_lo',0)},{enc_film_stats.get('clamp_scale_hi',0)}) "
+                                f"clamp_sh(lo,hi)=({enc_film_stats.get('clamp_shift_lo',0)},{enc_film_stats.get('clamp_shift_hi',0)})"
+                            )
+                        if isinstance(dec_film_stats, dict) and dec_film_stats:
+                            pbar.write(
+                                f"[FiLM/dec] nan_alpha={dec_film_stats.get('nan_count_alpha',0)} nan_beta={dec_film_stats.get('nan_count_beta',0)} "
+                                f"pre={dec_film_stats.get('pre',0.0):.2f} post={dec_film_stats.get('post',0.0):.2f}"
+                            )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                # D. 真实可训练张量的梯度范数（按模块）
+                try:
+                    def _mod_grad_norm(mod: Optional[nn.Module]) -> float:
+                        if mod is None:
+                            return 0.0
+                        grads = [p.grad for p in mod.parameters() if p.requires_grad and (p.grad is not None)]
+                        if not grads:
+                            return 0.0
+                        tot = torch.tensor(0.0, device=grads[0].device)
+                        for g in grads:
+                            tot = tot + (g.detach() ** 2).sum()
+                        return float(torch.sqrt(tot).item())
+
+                    enc_film = getattr(getattr(self.model, 'encoder', None), 'film', None)
+                    dec_refiner = getattr(getattr(self.model, 'decoder', None), 'refiner', None)
+                    dec_film = getattr(dec_refiner, 'film', None) if dec_refiner is not None else None
+                    enc_moe = getattr(getattr(self.model, 'encoder', None), 'moe', None)
+
+                    g_enc_film = _mod_grad_norm(enc_film)
+                    g_dec_ref = _mod_grad_norm(dec_refiner)
+                    g_dec_film = _mod_grad_norm(dec_film)
+                    g_enc_moe = _mod_grad_norm(enc_moe)
+
+                    pbar.write(
+                        f"[Grad] enc/film={g_enc_film:.3e} dec/refine={g_dec_ref:.3e} dec/film={g_dec_film:.3e} moe={g_enc_moe:.3e}"
+                    )
                 except Exception:
                     pass
                 self.log_training_progress(batch_idx, num_batches, loss_details, grad_norm, pbar)
@@ -1770,6 +1897,13 @@ def main():
     if args.channel_enable_step is not None:
         config['channel_disable_steps'] = int(args.channel_enable_step)
         config['channel_warmup_steps'] = 1000  # 固定1000步渐进启用
+
+    # B. CLI去重：后出现者优先；打印最终合并配置，避免日志混淆
+    try:
+        print("\n🧾 Final merged config (last-in-wins):")
+        print(json.dumps(config, indent=2, ensure_ascii=False, sort_keys=True))
+    except Exception:
+        pass
 
     # 验证配置
     print("=" * 60)

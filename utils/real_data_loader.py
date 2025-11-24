@@ -37,7 +37,8 @@ class AETHERRealDataset(Dataset):
                  features_file: Optional[str] = None,
                  audio_file: Optional[str] = None,
                  validation_split: float = 0.0,
-                 split_mode: str = "train"):
+                 split_mode: str = "train",
+                 teacher_latent_file: Optional[str] = None):
         """
         Args:
             data_dir: 数据目录
@@ -118,6 +119,34 @@ class AETHERRealDataset(Dataset):
         final_feature_frames = len(self.features)
         assert final_audio_frames == final_feature_frames, \
             f"对齐后仍不匹配: 音频{final_audio_frames} vs 特征{final_feature_frames}"
+
+        # 可选：加载 StableCodec teacher latent，并在帧级对齐
+        self.teacher_latent: Optional[torch.Tensor] = None
+        if teacher_latent_file is not None:
+            latent_path = Path(teacher_latent_file)
+            if latent_path.exists():
+                try:
+                    latent = torch.load(latent_path, map_location="cpu")
+                    if isinstance(latent, torch.Tensor) and latent.dim() == 2:
+                        t_latent = latent.size(0)
+                        t_min = min(t_latent, final_feature_frames)
+                        if t_latent != final_feature_frames:
+                            print(
+                                f"  [StableCodecTeacher] latent frames ({t_latent}) "
+                                f"!= feature frames ({final_feature_frames}); aligning to {t_min}"
+                            )
+                        self.teacher_latent = latent[:t_min].contiguous()
+                        if t_min < final_feature_frames:
+                            # 保守处理：进一步裁剪特征和音频以匹配teacher长度
+                            self.features = self.features[:t_min]
+                            audio_samples = t_min * self.frame_size
+                            self.audio = self.audio[:audio_samples]
+                    else:
+                        print(f"  [StableCodecTeacher] Ignoring latent {latent_path} with shape {getattr(latent, 'shape', None)}")
+                except Exception as _e:
+                    print(f"  [StableCodecTeacher] Failed to load latent from {latent_path}: {_e}")
+            else:
+                print(f"  [StableCodecTeacher] Latent file not found: {latent_path}")
 
         # 计算有效序列位置
         valid_start = 2  # 跳过前2帧
@@ -278,6 +307,14 @@ class AETHERRealDataset(Dataset):
             attempt += 1
             pos_idx = (pos_idx + 1) % len(self.valid_positions)
 
+        # StableCodec teacher latent 片段（若可用）
+        if self.teacher_latent is not None and end_frame <= self.teacher_latent.size(0):
+            teacher_seg = self.teacher_latent[start_frame:end_frame, :]
+            teacher_seg = teacher_seg.to(dtype=torch.float32)
+        else:
+            # 使用空张量占位，便于 collate；未启用teacher时不会参与loss
+            teacher_seg = torch.empty(0, 0, dtype=torch.float32)
+
         # 使用预计算的CSI缓存（高性能版本）
         if idx in self.csi_cache:
             csi_cached = self.csi_cache[idx]
@@ -299,14 +336,17 @@ class AETHERRealDataset(Dataset):
             'y': features.clone(),  # 自编码任务
             'audio': audio,
             'csi': csi_dict,
-            'seq_idx': idx
+            'seq_idx': idx,
+            'teacher_latent': teacher_seg,
         }
 
     def _generate_csi(self, audio: np.ndarray, features: torch.Tensor, idx: int) -> Dict[str, torch.Tensor]:
         """生成统一的10维信道状态信息（snr_db(1) + ber(1) + fading_onehot(8)）。"""
         # 基于音频真实能量计算SNR
-        energy = np.mean(audio ** 2)
-        snr_base = 10 * np.log10(energy + 1e-10) + 35
+        # 数值稳健：能量下限裁剪，避免 log10 产生 -inf/NaN
+        energy = float(np.mean(audio ** 2)) if len(audio) > 0 else 0.0
+        energy = max(energy, 1e-12)
+        snr_base = 10 * np.log10(energy) + 35
         snr_db = np.clip(snr_base + np.random.normal(0, 3), 0, 30)
 
         # 基于SNR计算BER
@@ -345,8 +385,9 @@ class AETHERRealDataset(Dataset):
                 audio_segment = self.audio[audio_start:audio_end]
 
                 # 基于音频能量计算SNR（无随机噪声，保证可重现）
-                energy = np.mean(audio_segment ** 2)
-                snr_base = 10 * np.log10(energy + 1e-10) + 35
+                energy = float(np.mean(audio_segment ** 2)) if len(audio_segment) > 0 else 0.0
+                energy = max(energy, 1e-12)
+                snr_base = 10 * np.log10(energy) + 35
                 snr_db = np.clip(snr_base, 0, 30)  # 移除随机噪声提高性能
 
                 # 基于SNR计算BER
@@ -603,20 +644,24 @@ def create_combined_data_loader(
 
     def paths_for(name: str):
         if small_ok:
-            return (
-                str(root / f"{name}_200k_36.f32"),
-                str(root / f"{name}_200k.pcm"),
-            )
+            features_path = root / f"{name}_200k_36.f32"
+            audio_path = root / f"{name}_200k.pcm"
+            latent_path = root / f"{name}_200k.pt"
         else:
-            return (
-                str(root / f"{name}_enhanced_36.f32"),
-                str(root / f"{name}_enhanced.pcm"),
-            )
+            features_path = root / f"{name}_enhanced_36.f32"
+            audio_path = root / f"{name}_enhanced.pcm"
+            latent_path = root / f"{name}_enhanced.pt"
+        return str(features_path), str(audio_path), str(latent_path)
 
     datasets: Dict[str, AETHERRealDataset] = {}
     for k in EXPERT_KEYS:
-        fpath, apath = paths_for(k)
+        fpath, apath, lpath = paths_for(k)
         try:
+            # 若不存在对应的 StableCodec latent，则对该子集禁用teacher
+            latent_file = lpath if Path(lpath).exists() else None
+            if latent_file is None:
+                print(f"  [WARN] StableCodec latent for expert '{k}' not found at {lpath}; teacher disabled for this subset")
+
             ds = AETHERRealDataset(
                 data_dir=data_root,
                 sequence_length=sequence_length,
@@ -627,6 +672,7 @@ def create_combined_data_loader(
                 feature_spec=feature_spec,
                 features_file=fpath,
                 audio_file=apath,
+                teacher_latent_file=latent_file,
             )
             datasets[k] = ds
         except FileNotFoundError as e:
