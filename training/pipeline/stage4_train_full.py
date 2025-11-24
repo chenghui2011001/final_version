@@ -11,11 +11,11 @@ regularisation terms.
 from __future__ import annotations
 
 import argparse
-import contextlib
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 import os
 import sys
+import json
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,8 @@ from models.maybe_useless.aether_fargan_decoder import AETHERFARGANDecoder
 # 双头解码器和SSL工具
 from models.semantic_augmented_aether_decoder import SemanticAugmentedAETHERDecoder
 from models.ssl_utils import load_ssl_model
+from models.hash_bottleneck import HashBottleneck
+from models.stablecodec_teacher import StableCodecDistillationLoss
 # Stage3语义模块（必需）
 from models.semantic_extractor import create_semantic_extractor
 from utils.fsk import TwoFSKModem
@@ -49,7 +51,6 @@ from training.losses import (
     rate_loss,
     router_consistency_loss,
 )
-from training.acoustic_adversarial_loss import create_acoustic_adversarial_loss
 from utils.real_data_loader import create_aether_data_loader, create_combined_data_loader
 from utils.channel_sim import ChannelSimulator
 from models.utils import build_csi_vec
@@ -63,9 +64,138 @@ try:
     from .wave_loss import fargan_wave_losses
 except Exception:
     from training.pipeline.stages import StageConfig, get_stage_config  # script mode fallback
-    from training.pipeline.wave_loss import fargan_wave_losses
+from training.pipeline.wave_loss import fargan_wave_losses
+try:
+    import wandb as _wandb
+except Exception:  # pragma: no cover
+    _wandb = None
 from tqdm.auto import tqdm
 
+
+class STFTSubDiscriminator(nn.Module):
+    """
+    单尺度 STFT 判别子网络：
+    - 输入为单个尺度的 STFT 幅度谱 [B, F, T]
+    - 使用 2D 卷积，时间维上膨胀 (1,2,4)，频率维 stride=2
+    - 输出多层特征 + 最终 score 特征图
+    """
+
+    def __init__(self, in_channels: int = 1, base_channels: int = 32):
+        super().__init__()
+        c = base_channels
+        layers = []
+        # 初始卷积：轻微 time/freq 感受野
+        layers.append(
+            nn.Conv2d(in_channels, c, kernel_size=(3, 9), stride=(1, 1), padding=(1, 4))
+        )
+        layers.append(nn.LeakyReLU(0.2, inplace=True))
+        # 三层带时间膨胀、频率下采样的卷积
+        for dilation_t in (1, 2, 4):
+            layers.append(
+                nn.Conv2d(
+                    c,
+                    c,
+                    kernel_size=(3, 9),
+                    stride=(2, 1),          # 频率维 stride=2
+                    padding=(1, 4 * dilation_t),
+                    dilation=(1, dilation_t),
+                )
+            )
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+        self.feature_layers = nn.ModuleList(layers)
+        self.out_conv = nn.Conv2d(c, 1, kernel_size=(3, 3), stride=1, padding=1)
+
+    def forward(self, mag: torch.Tensor) -> list:
+        """
+        mag: [B, F, T] STFT 幅度
+        returns: [feat1, feat2, ..., score]，其中 score 为 [B, 1, F', T']
+        """
+        x = mag.unsqueeze(1)  # [B, 1, F, T]
+        feats = []
+        h = x
+        for layer in self.feature_layers:
+            h = layer(h)
+            feats.append(h)
+        score = self.out_conv(h)
+        feats.append(score)
+        return feats
+
+
+class WaveDiscriminator(nn.Module):
+    """
+    多尺度 STFT 判别器（适配论文中的 multi-scale STFT discriminator 思路）。
+
+    - 对输入波形计算多个窗口长度的 STFT 幅度谱 [1024, 512, 256]
+    - 每个尺度使用一个 STFTSubDiscriminator
+    - 输出格式与 adv_train_fargan.py 中判别器兼容：
+      List[scale]，其中每个 scale 是 [feat1, feat2, ..., final_score]
+    """
+
+    def __init__(
+        self,
+        fft_sizes: Optional[List[int]] = None,
+        hop_factors: int = 4,
+        base_channels: int = 32,
+    ):
+        super().__init__()
+        if fft_sizes is None:
+            fft_sizes = [1024, 512, 256]
+        self.fft_sizes = list(fft_sizes)
+        self.hop_factors = hop_factors
+        self.sub_discriminators = nn.ModuleList(
+            [STFTSubDiscriminator(in_channels=1, base_channels=base_channels) for _ in self.fft_sizes]
+        )
+
+    @staticmethod
+    def _stft_mag_for_disc(x: torch.Tensor, fft_size: int, hop_size: int, win_length: int) -> torch.Tensor:
+        """
+        计算判别器用的 STFT 幅度谱，强制 float32 & log1p 幅度，输出 [B, F, T].
+        """
+        x32 = x.to(torch.float32)
+        window = torch.hann_window(win_length, device=x32.device, dtype=torch.float32)
+        spec = torch.stft(
+            x32,
+            n_fft=fft_size,
+            hop_length=hop_size,
+            win_length=win_length,
+            window=window,
+            return_complex=True,
+        )
+        mag = torch.abs(spec).clamp_min(1e-4)
+        return torch.log1p(mag)
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, 1, T] 或 [B, T]
+        returns: List[scale]，每个 scale 是 [feat1, feat2, ..., score]
+        """
+        if x.dim() == 3 and x.size(1) == 1:
+            x = x.squeeze(1)
+        assert x.dim() == 2, f"WaveDiscriminator expects [B, T] or [B,1,T], got {x.shape}"
+
+        outputs: List[List[torch.Tensor]] = []
+        for fs, sub_disc in zip(self.fft_sizes, self.sub_discriminators):
+            hop = max(1, fs // self.hop_factors)
+            win_len = fs
+            mag = self._stft_mag_for_disc(x, fs, hop, win_len)  # [B, F, T]
+            feats = sub_disc(mag)
+            outputs.append(feats)
+        return outputs
+
+
+def fmap_loss(scores_real, scores_gen):
+    """Feature matching loss，参考 dnn/torch/fargan/adv_train_fargan.py，并放大整体权重."""
+    num_discs = len(scores_real)
+    loss_feat = 0.0
+    for k in range(num_discs):
+        num_layers = len(scores_gen[k]) - 1
+        if num_layers <= 0:
+            continue
+        f = 4.0 / float(num_discs * num_layers)
+        for l in range(num_layers):
+            loss_feat = loss_feat + f * F.l1_loss(scores_gen[k][l], scores_real[k][l].detach())
+    # 论文中建议再整体乘以 5 以放大特征匹配损失的影响
+    return 5.0 * loss_feat
 # --------------------------
 # Distributed training utilities
 # --------------------------
@@ -540,6 +670,58 @@ def _sum_grad_norm(named_params, include_key=None, exclude_key=None):
     return total, n
 
 
+def _grad_sq_from_module(mod: Optional[nn.Module], exclude_name_contains: Optional[str] = None) -> float:
+    """Return sum of squared gradient norms for all params in a module.
+    If exclude_name_contains is provided, any parameter whose name contains the
+    substring will be skipped. Returns 0.0 if module is None or has no grads.
+    """
+    if mod is None:
+        return 0.0
+    try:
+        params = list(mod.named_parameters())
+    except Exception:
+        return 0.0
+    if not params:
+        return 0.0
+    dev = None
+    for _, p in params:
+        if p.grad is not None:
+            dev = p.grad.device
+            break
+    if dev is None:
+        return 0.0
+    s = torch.tensor(0.0, device=dev)
+    for name, p in params:
+        if (exclude_name_contains is not None) and (exclude_name_contains in name):
+            continue
+        if (p.grad is None) or (not p.requires_grad):
+            continue
+        g = torch.nan_to_num(p.grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        s = s + (g * g).sum()
+    return float(s.item())
+
+
+def _grad_sq_from_params(params_iter) -> float:
+    """Return sum of squared gradient norms for an iterable of parameters."""
+    params_list = list(params_iter)
+    if not params_list:
+        return 0.0
+    dev = None
+    for p in params_list:
+        if p.grad is not None:
+            dev = p.grad.device
+            break
+    if dev is None:
+        return 0.0
+    s = torch.tensor(0.0, device=dev)
+    for p in params_list:
+        if (p.grad is None) or (not p.requires_grad):
+            continue
+        g = torch.nan_to_num(p.grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        s = s + (g * g).sum()
+    return float(s.item())
+
+
 def _set_requires_grad(module: nn.Module, flag: bool, name_hint: str = "") -> None:
     for p in module.parameters():
         p.requires_grad = flag
@@ -573,6 +755,12 @@ def train_one_epoch(
     use_adversarial_loss: bool = False,
     acoustic_adv_loss = None,
     disc_optimizer: Optional[optim.Optimizer] = None,
+    # New knobs passed from CLI
+    use_adaptive_loss_weights: bool = False,
+    grad_cos_interval: int = 0,
+    wandb_enabled: bool = False,
+    disable_semantic_runtime: bool = False,
+    hash_bottleneck: Optional[HashBottleneck] = None,
 ) -> Tuple[Dict[str, float], float]:
     encoder.train()
     decoder.train()
@@ -581,6 +769,19 @@ def train_one_epoch(
     items = 0
 
     chan_sim = ChannelSimulator()
+
+    # Hash bottleneck configuration (set via static attributes from main())
+    enable_hash = bool(getattr(train_one_epoch, '_enable_hash_bottleneck', False)) and (hash_bottleneck is not None)
+    hash_channel_type = str(getattr(train_one_epoch, '_hash_channel_type', 'bsc'))
+    hash_ber = float(getattr(train_one_epoch, '_hash_ber', 0.0))
+    hash_snr_db = float(getattr(train_one_epoch, '_hash_snr_db', 10.0))
+    hash_start_step = int(getattr(train_one_epoch, '_hash_channel_start_step', 0))
+    hash_reg_weight = float(getattr(train_one_epoch, '_hash_reg_weight', 0.0))
+    hash_rate_weight = float(getattr(train_one_epoch, '_hash_rate_weight', 0.0))
+    # Wave GAN loss weights (set via CLI)
+    lambda_adv = float(getattr(train_one_epoch, '_lambda_adv', 0.5))
+    lambda_fm = float(getattr(train_one_epoch, '_lambda_fm', 1.0))
+    disc_update_prob = float(getattr(train_one_epoch, '_disc_update_prob', 1.0))
 
     # Freeze/unfreeze guards (persist across calls)
     if not hasattr(train_one_epoch, '_frozen'):  # type: ignore
@@ -642,7 +843,12 @@ def train_one_epoch(
         csi_cond = csi_sim
         if selected_csi_keys is not None:
             try:
-                csi_cond = {k: v for k, v in csi_sim.items() if k in selected_csi_keys}
+                # Filter to selected keys but avoid empty CSI; fallback to original when nothing matches
+                filt = {k: v for k, v in csi_sim.items() if k in selected_csi_keys}
+                # If proxies not available yet (early steps), fall back to raw SNR-based CSI
+                if not filt:
+                    filt = csi_sim
+                csi_cond = filt
             except Exception:
                 pass
 
@@ -697,6 +903,66 @@ def train_one_epoch(
                     csi_cond.setdefault('los_ratio', los_rand)
             except Exception:
                 pass
+
+        # ----------------------------
+        # JSCC Day2/Day4: CSI权重
+        # Day2：使用 batch 级标量权重；
+        # Day4：在内部保留 batch 标量（用于日志），但对 loss 采用“更激进”的缩放：
+        #        wave: 0.3..1.0, acoustic: 1.0..1.7，随 badness 单调变化。
+        # badness 定义：
+        #   - 低SNR / 高TS / 高FS / 低LOS → bad ↑
+        #   - 高SNR / 低TS / 低FS / 高LOS → bad ↓
+        # ----------------------------
+        jscc_wave_w = 1.0   # 日志/诊断用
+        jscc_acou_w = 1.0   # 日志/诊断用
+        jscc_bad = 0.0
+        if step >= rand_start and isinstance(csi_cond, dict):
+            try:
+                snr_proxy = None
+                if 'snr_proxy' in csi_cond and torch.is_tensor(csi_cond['snr_proxy']):
+                    snr_proxy = csi_cond['snr_proxy'].detach()
+                elif 'snr_db' in csi_cond and torch.is_tensor(csi_cond['snr_db']):
+                    snr_proxy = csi_cond['snr_db'].detach()
+
+                ts = csi_cond.get('time_selectivity', None)
+                fs = csi_cond.get('freq_selectivity', None)
+                los = csi_cond.get('los_ratio', None)
+
+                # 归一化到[0,1]
+                if snr_proxy is not None:
+                    snr_norm = ((snr_proxy.clamp(-5.0, 5.0) + 5.0) / 10.0).mean().item()
+                else:
+                    snr_norm = 0.5
+
+                ts_norm = ts.clamp(0.0, 1.0).mean().item() if torch.is_tensor(ts) else 0.5
+                fs_norm = fs.clamp(0.0, 1.0).mean().item() if torch.is_tensor(fs) else 0.5
+                los_norm = los.clamp(0.0, 1.0).mean().item() if torch.is_tensor(los) else 0.5
+
+                # badness: 0=最好, 1=最差
+                snr_bad = 1.0 - snr_norm          # 低SNR更坏
+                ts_bad = ts_norm                  # 高TS更坏
+                fs_bad = fs_norm                  # 高FS更坏
+                los_bad = 1.0 - los_norm          # 低LOS更坏
+                bad = max(0.0, min(1.0, 0.25 * (snr_bad + ts_bad + fs_bad + los_bad)))
+                good = 1.0 - bad
+                jscc_bad = float(bad)
+                # Day4: 更明显的JSCC trade-off（坏信道强化声学，弱化波形）
+                #       wave: 0.3..1.0, acoustic: 1.0..1.7
+                jscc_wave_w = 0.3 + 0.7 * good    # good=1→1.0, bad=1→0.3
+                jscc_acou_w = 1.0 + 0.7 * bad     # good=1→1.0, bad=1→1.7
+            except Exception:
+                jscc_wave_w = 1.0
+                jscc_acou_w = 1.0
+                jscc_bad = 0.0
+
+        # 将 batch 级 JSCC “坏度” 传给解码端 FiLM（ConvRefineDecoder）
+        # 仅在 refiner 支持 _jscc_bad 时生效；其余情况安全忽略。
+        try:
+            ref = getattr(decoder, 'refiner', None)
+            if ref is not None and hasattr(ref, '_jscc_bad'):
+                ref._jscc_bad = float(max(0.0, min(1.0, jscc_bad)))
+        except Exception:
+            pass
         # Monkey-patch build_csi_vec path by passing through csi_dict internally
         # Here we override csi to just carry the tensors we want; encoder will rebuild vec to target dim
         # (AETHEREncoder uses models.utils.build_csi_vec)
@@ -712,7 +978,7 @@ def train_one_epoch(
         else:
             csi_for_enc = csi_cond
 
-        # MoE warm-up: freeze encoder.moe params for initial steps
+        # MoE warm-up: freeze encoder.moe params for initial steps (A. 一次性冻结/解冻)
         if freeze_moe_steps > 0:
             if step == 0 and not train_one_epoch._frozen['moe'] and hasattr(encoder, 'moe') and encoder.moe is not None:
                 _set_requires_grad(encoder.moe, False, 'moe')
@@ -723,7 +989,7 @@ def train_one_epoch(
                 train_one_epoch._frozen['moe'] = False
                 safe_print("[Warmup] Unfreeze MoE")
 
-        # Decoder (wave head) warm-up: freeze decoder params for initial steps
+        # Decoder (wave head) warm-up: freeze decoder params for initial steps (A. 一次性冻结/解冻)
         if freeze_dec_steps > 0:
             if step == 0 and not train_one_epoch._frozen['dec']:
                 _set_requires_grad(decoder, False, 'decoder')
@@ -733,6 +999,25 @@ def train_one_epoch(
                 _set_requires_grad(decoder, True, 'decoder')
                 train_one_epoch._frozen['dec'] = False
                 safe_print("[Warmup] Unfreeze decoder")
+
+        # FiLM warm-up: explicitly freeze encoder.film and decoder.refiner.film params once, then unfreeze at threshold (A)
+        if freeze_film_steps > 0 and hasattr(encoder, 'film'):
+            enc_film = getattr(encoder, 'film', None)
+            dec_film = getattr(getattr(decoder, 'refiner', None), 'film', None) if hasattr(decoder, 'refiner') else None
+            if step == 0 and not train_one_epoch._frozen['film']:
+                if enc_film is not None:
+                    _set_requires_grad(enc_film, False, 'enc.film')
+                if dec_film is not None:
+                    _set_requires_grad(dec_film, False, 'dec.refiner.film')
+                train_one_epoch._frozen['film'] = True
+                safe_print(f"[Warmup] Freeze FiLM (enc+dec) for first {freeze_film_steps} steps")
+            if step == freeze_film_steps and train_one_epoch._frozen['film']:
+                if enc_film is not None:
+                    _set_requires_grad(enc_film, True, 'enc.film')
+                if dec_film is not None:
+                    _set_requires_grad(dec_film, True, 'dec.refiner.film')
+                train_one_epoch._frozen['film'] = False
+                safe_print("[Warmup] Unfreeze FiLM (enc+dec)")
 
         # Forward pass with mixed precision
         try:
@@ -806,33 +1091,45 @@ def train_one_epoch(
                 print(f"  z range: [{z.min():.6f}, {z.max():.6f}]")
                 print(f"  z shape: {z.shape}")
                 z = torch.nan_to_num(z, nan=0.0, posinf=10.0, neginf=-10.0)
-            if use_2fsk and fsk_modem is not None:
-                with torch.no_grad():
-                    bits, meta = fsk_modem.bits_from_z(z.detach(), bits_per_frame=fsk_bits_per_frame)
-                    wave = fsk_modem.modulate(bits)
-                    # AWGN using batch-mean SNR
-                    snr_db = csi_sim['snr_db'].detach().cpu()
-                    for b in range(wave.size(0)):
-                        snr_lin = float(torch.pow(10.0, snr_db[b] / 20.0))
-                        std = float(wave[b].std().item() / (snr_lin + 1e-6))
-                        wave[b] += torch.randn_like(wave[b]) * std
-                    bits_hat = fsk_modem.demodulate(wave)
-                    z = fsk_modem.z_from_bits(bits_hat, meta).to(device)
-            elif stage_cfg.apply_channel:
-                # Apply channel only after start step (revival skips channel)
-                ch_start = int(getattr(train_one_epoch, '_channel_start_step', 0))
-                if step >= ch_start:
-                    z = chan_sim.apply(z, amp_t, snr_db_t)
+            # Optional hash bottleneck path (Stage4+hash mode)
+            hash_results: Optional[Dict[str, torch.Tensor]] = None
+            if enable_hash and hash_bottleneck is not None:
+                # Hash-level channel enable schedule (similar to latent channel)
+                hash_channel_enabled = (step >= hash_start_step)
+                channel_params = None
+                if hash_channel_enabled and hash_channel_type != 'none':
+                    if hash_channel_type == 'bsc':
+                        channel_params = {'ber': hash_ber}
+                    elif hash_channel_type == 'bpsk_awgn':
+                        # Use CLI-specified SNR for now (can be tied to CSI later)
+                        channel_params = {'snr_db': hash_snr_db}
+                hash_results = hash_bottleneck(z, channel_params=channel_params)
+                z = hash_results['reconstructed']
+            else:
+                if use_2fsk and fsk_modem is not None:
+                    with torch.no_grad():
+                        bits, meta = fsk_modem.bits_from_z(z.detach(), bits_per_frame=fsk_bits_per_frame)
+                        wave = fsk_modem.modulate(bits)
+                        # AWGN using batch-mean SNR
+                        snr_db = csi_sim['snr_db'].detach().cpu()
+                        for b in range(wave.size(0)):
+                            snr_lin = float(torch.pow(10.0, snr_db[b] / 20.0))
+                            std = float(wave[b].std().item() / (snr_lin + 1e-6))
+                            wave[b] += torch.randn_like(wave[b]) * std
+                        bits_hat = fsk_modem.demodulate(wave)
+                        z = fsk_modem.z_from_bits(bits_hat, meta).to(device)
+                elif stage_cfg.apply_channel:
+                    # Apply channel only after start step (revival skips channel)
+                    ch_start = int(getattr(train_one_epoch, '_channel_start_step', 0))
+                    if step >= ch_start:
+                        z = chan_sim.apply(z, amp_t, snr_db_t)
 
-            # Update decoder-side residual MoE with start gating (revival skips dec_moe)
-            try:
-                if hasattr(decoder, 'dec_moe') and decoder.dec_moe is not None:
-                    dm_start = int(getattr(train_one_epoch, '_dec_moe_start_step', 0))
-                    decoder.enable_dec_moe = bool(step >= dm_start)
-                    if hasattr(decoder.dec_moe, 'set_training_step'):
-                        decoder.dec_moe.set_training_step(step)
-            except Exception:
-                pass
+            # (decoder-side residual MoE removed)
+            if hasattr(decoder, 'refiner') and hasattr(decoder.refiner, 'set_training_step'):
+                try:
+                    decoder.refiner.set_training_step(step)
+                except Exception:
+                    pass
             # SNR-aware period smoothing: disable during revival to match Stage3
             if not revival_active:
                 try:
@@ -877,24 +1174,22 @@ def train_one_epoch(
                     wav_ = None
                 return feats_, wav_
 
-            # 检查是否使用语义增强解码器（兼容DDP包裹）
-            dec_core = getattr(decoder, 'module', decoder)
-            use_semantic_decoder = hasattr(dec_core, 'get_semantic_info')
+            # 检查是否使用语义增强解码器
+            use_semantic_decoder = hasattr(decoder, 'get_semantic_info')
 
             if use_semantic_decoder:
-                # 语义增强模式：使用no_sync避免第一次调用的梯度同步冲突
-                with (decoder.no_sync() if hasattr(decoder, 'no_sync') else contextlib.nullcontext()):
-                    if revival_active:
-                        try:
-                            from torch.amp import autocast as _ab_autocast
-                            with _ab_autocast('cuda', enabled=False):
-                                out = decoder(z.float(), dec_csi, return_wave=False)  # 不需要波形，减少计算
-                        except Exception:
-                            from torch.amp import autocast as _ab_autocast
-                            with _ab_autocast('cuda', enabled=False):
-                                out = decoder(z.float(), dec_csi, return_wave=False)
-                    else:
-                        out = decoder(z, dec_csi, return_wave=False)
+                # 语义增强模式：直接在后面的分支中处理，这里只做基础前向用于兼容性
+                if revival_active:
+                    try:
+                        from torch.amp import autocast as _ab_autocast
+                        with _ab_autocast('cuda', enabled=False):
+                            out = decoder(z.float(), dec_csi, return_wave=False)  # 不需要波形，减少计算
+                    except Exception:
+                        from torch.amp import autocast as _ab_autocast
+                        with _ab_autocast('cuda', enabled=False):
+                            out = decoder(z.float(), dec_csi, return_wave=False)
+                else:
+                    out = decoder(z, dec_csi, return_wave=False)
 
                 # 暂时从基础解码器获取特征，后面会被融合特征替换
                 feats, wav = _normalize_decoder_output(out)
@@ -947,6 +1242,8 @@ def train_one_epoch(
             except Exception:
                 pass
             feats = feats[:, : y.size(1), :]
+            # 数值清洗：避免下游loss/梯度出现NaN/Inf
+            feats = torch.nan_to_num(feats, nan=0.0, posinf=1e4, neginf=-1e4)
 
             # 🔧 移除recon_base计算，因为已由acoustic_loss和semantic_loss替代
             # 可选的layered loss（如果启用）
@@ -963,21 +1260,44 @@ def train_one_epoch(
             acoustic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
 
             # 🔥 CRITICAL: Execute semantic augmentation BEFORE wave_loss to ensure wav is not None
+            # Early-step decoder stability: run decoder in fp32 for first 1000 steps when inputs are fp16/bf16
+            in_dtype = z.dtype
+            dec_safe_fp32 = (in_dtype in (torch.float16, torch.bfloat16)) and (int(step) < 1000)
+
             if use_semantic_decoder:
                 try:
                     # 🔥 关键修复：直接使用语义增强模式获取融合后的波形和特征
                     # 这样FARGAN就直接使用融合后的特征合成波形
-                    decoder_outputs = decoder(z, dec_csi, enable_semantic_output=True, return_wave=True, target_len=audio.size(-1))
+                    dec_in = z.float() if dec_safe_fp32 else z
+                    decoder_outputs = decoder(dec_in, dec_csi, enable_semantic_output=True, return_wave=True, target_len=audio.size(-1))
 
-                    # 提取融合后的特征和波形
-                    acoustic_features = decoder_outputs['acoustic_features']   # [B, T, 20] 融合后A20
-                    acoustic_raw = decoder_outputs['acoustic_raw']             # [B, T, 20] 预融合20维
-                    semantic_features = decoder_outputs['semantic_features']   # [B, T, 16]
-                    enhanced_features_36d = decoder_outputs['features_36d']    # [B, T, 36] 融合后36维
+                    # 提取融合后的特征和波形（兼容禁用语义时返回tuple(features,wave)的情形）
+                    if isinstance(decoder_outputs, dict):
+                        acoustic_features = decoder_outputs['acoustic_features']   # [B, T, 20]
+                        acoustic_raw = decoder_outputs['acoustic_raw']             # [B, T, 20]
+                        semantic_features = decoder_outputs['semantic_features']   # [B, T, 16]
+                        enhanced_features_36d = decoder_outputs['features_36d']    # [B, T, 36]
+                    else:
+                        # 兼容: 语义运行时被禁用（disable_semantic_at_runtime），forward 返回基础AETHER输出
+                        if isinstance(decoder_outputs, (tuple, list)) and len(decoder_outputs) == 2:
+                            base_features, base_wave = decoder_outputs
+                            wav = base_wave
+                        else:
+                            base_features = decoder_outputs
+                        enhanced_features_36d = base_features
+                        acoustic_raw = base_features[..., :20]
+                        acoustic_features = acoustic_raw
+                        semantic_features = base_features[..., 20:36]
+                    # 数值清洗
+                    acoustic_features = torch.nan_to_num(acoustic_features, nan=0.0, posinf=1e4, neginf=-1e4)
+                    acoustic_raw = torch.nan_to_num(acoustic_raw, nan=0.0, posinf=1e4, neginf=-1e4)
+                    semantic_features = torch.nan_to_num(semantic_features, nan=0.0, posinf=1e4, neginf=-1e4)
+                    enhanced_features_36d = torch.nan_to_num(enhanced_features_36d, nan=0.0, posinf=1e4, neginf=-1e4)
 
                     # 🚀 使用基于融合特征合成的波形
-                    if 'wave' in decoder_outputs and decoder_outputs['wave'] is not None:
+                    if isinstance(decoder_outputs, dict) and ('wave' in decoder_outputs) and (decoder_outputs['wave'] is not None):
                         wav = decoder_outputs['wave']  # 基于融合特征的波形
+                        wav = torch.nan_to_num(wav, nan=0.0, posinf=1.0, neginf=-1.0)
                         if step % 20 == 0:  # 减少打印频率
                             print(f"[INFO] Using enhanced wave synthesis (shape: {wav.shape})")
 
@@ -993,9 +1313,14 @@ def train_one_epoch(
                             except Exception:
                                 pass
                     else:
-                        print(f"[WARNING] Enhanced wave synthesis not available, falling back to standard synthesis")
+                        # 只有在语义增强真正启用时才提示增强合成不可用
+                        try:
+                            if bool(getattr(decoder, 'enable_semantic_augmentation', False)):
+                                print(f"[WARNING] Enhanced wave synthesis not available, falling back to standard synthesis")
+                        except Exception:
+                            pass
                         # 回退到标准合成
-                        if revival_active:
+                        if revival_active or dec_safe_fp32:
                             try:
                                 from torch.amp import autocast as _ab_autocast
                                 with _ab_autocast('cuda', enabled=False):
@@ -1005,6 +1330,8 @@ def train_one_epoch(
                         else:
                             fallback_out = decoder(z, dec_csi, return_wave=True, target_len=audio.size(-1))
                         _, wav = _normalize_decoder_output(fallback_out)
+                        if wav is not None:
+                            wav = torch.nan_to_num(wav, nan=0.0, posinf=1.0, neginf=-1.0)
 
                     # 确保wav不为None
                     if wav is None:
@@ -1020,49 +1347,21 @@ def train_one_epoch(
                     except Exception:
                         pass
 
-                    # 计算声学损失和语义损失（在这里计算，避免重复）
+                    # 声学特征损失弱化为 regularizer（可选）
                     acoustic_target = y[..., :20]  # [B, T, 20]
-
-                    if use_adversarial_loss and acoustic_adv_loss is not None:
-                        # 对抗损失（生成器部分）
-                        acoustic_loss, acoustic_metrics = acoustic_adv_loss.compute_generator_loss(
-                            acoustic_features, acoustic_target
-                        )
-                        acoustic_loss = acoustic_loss * float(getattr(train_one_epoch, '_alpha_acoustic', 1.0))
-
-                        # 添加融合正则项：防止A20偏离原始20维太远
-                        fusion_reg_weight = float(getattr(train_one_epoch, '_fusion_reg_weight', 0.1))
-                        if fusion_reg_weight > 0.0:
-                            fusion_regularizer = F.mse_loss(acoustic_features, acoustic_raw) * fusion_reg_weight
-                            acoustic_loss = acoustic_loss + fusion_regularizer
-                            acoustic_metrics['fusion_regularizer'] = fusion_regularizer.item()
-                            acoustic_metrics['fusion_reg_weight'] = fusion_reg_weight
-
-                        # 记录对抗损失指标
-                        if step % 20 == 0:
-                            print(f"🎯 Acoustic Adversarial Metrics (Step {step}):")
-                            for k, v in acoustic_metrics.items():
-                                print(f"  {k}: {v:.6f}")
-                    else:
-                        # 🔥 自适应维度保护：加权L1损失
-                        # 维度重要性权重：能量维度权重更高
+                    try:
                         dim_weights = torch.tensor([
-                            3.0,  # Dim 0: 能量维度，最重要
-                            2.0, 2.0, 1.5, 1.5, 1.5,  # Dim 1-5: 低频倒谱
-                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Dim 6-11: 中频倒谱
-                            0.8, 0.8, 0.8, 0.8, 0.8, 0.8,  # Dim 12-17: 高频倒谱
-                            2.5,  # Dim 18: F0，重要
-                            1.2   # Dim 19: 相关性
+                            3.0,
+                            2.0, 2.0, 1.5, 1.5, 1.5,
+                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                            0.8, 0.8, 0.8, 0.8, 0.8, 0.8,
+                            2.5,
+                            1.2
                         ], device=acoustic_features.device).view(1, 1, 20)
-
                         weighted_diff = torch.abs(acoustic_features - acoustic_target) * dim_weights
-                        acoustic_loss = weighted_diff.mean() * float(getattr(train_one_epoch, '_alpha_acoustic', 1.0))
-
-                        # 添加融合正则项：防止A20偏离原始20维太远
-                        fusion_reg_weight = float(getattr(train_one_epoch, '_fusion_reg_weight', 0.1))
-                        if fusion_reg_weight > 0.0:
-                            fusion_regularizer = F.mse_loss(acoustic_features, acoustic_raw) * fusion_reg_weight
-                            acoustic_loss = acoustic_loss + fusion_regularizer
+                        acoustic_loss = weighted_diff.mean() * float(getattr(train_one_epoch, '_alpha_acoustic', 0.1))
+                    except Exception:
+                        acoustic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
 
                     # 计算语义损失（启用 cosine/mse/infonce/cosine+infoce + 波形级约束 + 20→16蒸馏）
                     try:
@@ -1070,7 +1369,8 @@ def train_one_epoch(
                         alpha_semantic = float(getattr(train_one_epoch, '_alpha_semantic', 0.3))
                         # 渐进式权重：前10k步逐渐加强监督
                         train_progress = min(1.0, step / 10000.0)
-                        sem_scale = alpha_semantic * (0.1 + 0.9 * train_progress)
+                        # 修复 double-scaling：内部仅使用 schedule，外层再乘 alpha_semantic
+                        sem_scale = (0.1 + 0.9 * train_progress)
 
                         teacher_mode = str(getattr(train_one_epoch, '_semantic_teacher', 'ssl'))
                         ssl_teacher = getattr(train_one_epoch, '_ssl_teacher', None)
@@ -1106,14 +1406,14 @@ def train_one_epoch(
                                 # 20→16蒸馏特征（若存在）
                                 distill_feat = decoder_outputs.get('acoustic_semantic_distill', None)
 
-                                # 调用底层模块以兼容DDP
-                                sem_dec_loss, _sem_metrics = dec_core.compute_semantic_loss(
+                                sem_dec_loss, _sem_metrics = decoder.compute_semantic_loss(
                                     semantic_features,
                                     ssl_feats,
                                     loss_type=sem_loss_type,
                                     wave_gt=audio,
                                     wave_rec=wav if wav is not None else None,
                                     ssl_extractor=ssl_adapter,
+                                    wave_semantic_weight=wwave,
                                     acoustic_semantic_distill=distill_feat,
                                     distill_weight=wdist,
                                 )
@@ -1205,12 +1505,38 @@ def train_one_epoch(
                     semantic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
                     acoustic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
 
-            # 最终确保wav不为None
-            if wav is None:
-                print(f"[CRITICAL ERROR] wav is still None before wave_loss, generating emergency fallback")
-                B, T = feats.shape[:2]
-                target_wav_len = audio.size(-1) if audio is not None else T * 160
-                wav = torch.zeros(B, target_wav_len, device=feats.device, dtype=feats.dtype)
+            else:
+                # 非语义解码器路径：直接使用基础AETHER解码器在语义融合前的36维特征，
+                # 取前20维作为声学特征，只做弱加权L1 regularizer
+                acoustic_features = feats[..., :20]  # [B, T, 20]
+                acoustic_target = y[..., :20]
+                try:
+                    dim_weights = torch.tensor([
+                        3.0,
+                        2.0, 2.0, 1.5, 1.5, 1.5,
+                        1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                        0.8, 0.8, 0.8, 0.8, 0.8, 0.8,
+                        2.5,
+                        1.2
+                    ], device=acoustic_features.device).view(1, 1, 20)
+                    weighted_diff = torch.abs(acoustic_features - acoustic_target) * dim_weights
+                    acoustic_loss = weighted_diff.mean() * float(getattr(train_one_epoch, '_alpha_acoustic', 0.1))
+                except Exception:
+                    acoustic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+
+                # JSCC Day2/Day4: apply CSI-based weight to acoustic loss (batch-level)
+                try:
+                    # Day4: 使用更新后的更强JSCC权重（bad信道→放大声学损失）
+                    acoustic_loss = acoustic_loss * acoustic_loss.new_tensor(jscc_acou_w)
+                except Exception:
+                    pass
+
+                # 最终确保wav不为None
+                if wav is None:
+                    print(f"[CRITICAL ERROR] wav is still None before wave_loss, generating emergency fallback")
+                    B, T = feats.shape[:2]
+                    target_wav_len = audio.size(-1) if audio is not None else T * 160
+                    wav = torch.zeros(B, target_wav_len, device=feats.device, dtype=feats.dtype)
 
             # Wave loss with optional teacher-forced period mix
             # Robust period estimate: support both decoder-specific estimator and generic mapping
@@ -1242,16 +1568,23 @@ def train_one_epoch(
             rms_tgt  = torch.sqrt(aud_b.float().pow(2).mean(dim=-1) + eps)  # [B]
             scale = (rms_tgt / (rms_pred + eps)).clamp(0.25, 4.0).unsqueeze(-1)  # [B,1]
             wav_scaled = wav_b * scale
+            # Length alignment for adversarial training
+            min_len = min(wav_b.size(-1), aud_b.size(-1))
+            wav_b_aligned = wav_b[..., :min_len]
+            aud_b_aligned = aud_b[..., :min_len]
+            wav_scaled_aligned = wav_scaled[..., :min_len]
+
             # Content loss on RMS-matched signals
-            wave_loss_pred, _ = fargan_wave_losses(
-                wav_scaled, aud_b, period_pred, device=device, train_weights=wave_train_weights
+            wave_loss_pred, wave_details_pred = fargan_wave_losses(
+                wav_scaled_aligned, aud_b_aligned, period_pred, device=device, train_weights=wave_train_weights
             )
             if tf_ratio > 0.0:
                 # Teacher-forced variant with RMS matching as well
                 scale_tf = (rms_tgt / (rms_pred + eps)).clamp(0.25, 4.0).unsqueeze(-1)
                 wav_scaled_tf = wav_b * scale_tf
+                wav_scaled_tf_aligned = wav_scaled_tf[..., :min_len]
                 wave_loss_tf, _ = fargan_wave_losses(
-                    wav_scaled_tf, aud_b, period_gt, device=device, train_weights=wave_train_weights
+                    wav_scaled_tf_aligned, aud_b_aligned, period_gt, device=device, train_weights=wave_train_weights
                 )
                 wave_loss = (1.0 - tf_ratio) * wave_loss_pred + tf_ratio * wave_loss_tf
             else:
@@ -1262,6 +1595,12 @@ def train_one_epoch(
             amp_pen = torch.mean((rms_db_pred - rms_db_tgt).abs())  # L1 in dB
             amp_pen_w = 0.1
             wave_loss = wave_loss + amp_pen_w * amp_pen
+            # JSCC Day2/Day4: apply CSI-based weight to wave loss (batch-level)
+            try:
+                # Day4: 使用更新后的更强JSCC权重（bad信道→缩小wave损失权重）
+                wave_loss = wave_loss * wave_loss.new_tensor(jscc_wave_w)
+            except Exception:
+                pass
             # Debug: keep raw (pre-weight schedule)
             wave_loss_before_weight = wave_loss.detach().clone()
             wave_weight = StageConfig.scheduled_value(
@@ -1282,6 +1621,47 @@ def train_one_epoch(
             var_t = feats.float().var(dim=1).mean()
             anti_static = (1.0 / (var_t + 1e-3)).clamp(max=1e3)
 
+            # 波形对抗与特征匹配损失（多尺度 STFT 判别器）
+            adv_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+            fm_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+            if use_adversarial_loss and acoustic_adv_loss is not None and disc_optimizer is not None:
+                try:
+                    # 判别器更新（LSGAN 风格），采用概率更新以避免 D 过强（默认 6/7）
+                    update_disc = True
+                    if 0.0 <= disc_update_prob < 1.0:
+                        # 使用 torch.rand 产生一次性 Bernoulli
+                        update_disc = bool(torch.rand(1, device=device) < disc_update_prob)
+
+                    if update_disc:
+                        real_scores = acoustic_adv_loss(aud_b_aligned.unsqueeze(1))   # 实波形
+                        fake_scores_det = acoustic_adv_loss(wav_b_aligned.detach().unsqueeze(1))  # 生成波形（detach）
+                        disc_loss = 0.0
+                        for scale in fake_scores_det:
+                            disc_loss = disc_loss + (scale[-1] ** 2).mean()
+                        for scale in real_scores:
+                            disc_loss = disc_loss + ((1.0 - scale[-1]) ** 2).mean()
+                        disc_loss = 0.5 * disc_loss / len(fake_scores_det)
+
+                        disc_optimizer.zero_grad(set_to_none=True)
+                        disc_loss.backward(retain_graph=True)
+                        disc_optimizer.step()
+
+                    # 生成器对抗损失 + 特征匹配（始终按最新 D 计算）
+                    fake_scores = acoustic_adv_loss(wav_b_aligned.unsqueeze(1))
+                    real_scores = acoustic_adv_loss(aud_b_aligned.unsqueeze(1))
+                    adv_loss = 0.0
+                    for scale in fake_scores:
+                        adv_loss = adv_loss + ((1.0 - scale[-1]) ** 2).mean()
+                    adv_loss = adv_loss / len(fake_scores)
+                    fm_loss = fmap_loss(real_scores, fake_scores)
+                except Exception as _e_adv:
+                    try:
+                        safe_print(f"[WARN] Wave adversarial path failed at step {step}: {_e_adv}")
+                    except Exception:
+                        pass
+                    adv_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+                    fm_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+
             # Stage3-style optional stats printing
             try:
                 stats_iv = int(getattr(args, 'feat_stats_interval', 20) or 0)
@@ -1290,9 +1670,7 @@ def train_one_epoch(
             if stats_iv > 0 and (step % stats_iv == 0):
                 # Prefer raw 36-d features (pre-fusion) for 36-d stats; fallback to current feats
                 try:
-                    # Probe-only forward for stats: avoid building autograd graph
-                    with torch.no_grad():
-                        dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
+                    dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
                 except Exception:
                     dh_probe = None
 
@@ -1348,11 +1726,18 @@ def train_one_epoch(
             balance_weight_adjusted = stage_cfg.lambda_balance * 0.5  # 降低MoE平衡损失权重
             router_weight_adjusted = stage_cfg.lambda_cons * 0.3      # 降低路由一致性权重
 
-            # 🔥 联合优化：自适应权重平衡
-            # 计算损失平衡权重（避免某个损失过度主导）
-            wave_w = alpha_wave
-            acoustic_w = max(0.1, min(2.0, wave_loss.item() / max(acoustic_loss.item(), 1e-6)))
-            semantic_w = max(0.1, min(1.0, wave_loss.item() / max(semantic_loss.item(), 1e-6)))
+            # 🔥 联合优化：默认使用固定权重，避免 item() 带来的抖动；可用 CLI 开启自适应
+            use_adaptive = bool(use_adaptive_loss_weights)
+            wave_w = float(alpha_wave)
+            if use_adaptive:
+                acoustic_w = max(0.1, min(2.0, wave_loss.item() / max(acoustic_loss.item(), 1e-6)))
+                semantic_w = max(0.1, min(1.0, wave_loss.item() / max(semantic_loss.item(), 1e-6)))
+            else:
+                acoustic_w = float(getattr(train_one_epoch, '_alpha_acoustic', 1.0))
+                # 当禁用语义运行时，语义权重置零
+                semantic_w = float(getattr(train_one_epoch, '_alpha_semantic', 0.0))
+                if bool(disable_semantic_runtime):
+                    semantic_w = 0.0
 
             # 联合损失：考虑声学-语义的相互依赖（修复dict键判断）
             cross_modal_loss = 0.0
@@ -1368,10 +1753,54 @@ def train_one_epoch(
             except Exception:
                 pass
 
-            # 不额外合并语义正则分量（波形/蒸馏）到跨模态项，保持原语义项口径
+            # StableCodec teacher distillation loss（若提供 teacher_latent）
+            distill_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+            distill_fn = getattr(train_one_epoch, '_stablecodec_distill_fn', None)
+            lambda_distill = float(getattr(train_one_epoch, '_stablecodec_distill_weight', 0.0))
+            if lambda_distill > 0.0 and distill_fn is not None:
+                try:
+                    teacher_latent_batch = batch.get("teacher_latent", None)
+                except Exception:
+                    teacher_latent_batch = None
+                if teacher_latent_batch is not None:
+                    tl = teacher_latent_batch
+                    if isinstance(tl, torch.Tensor):
+                        tl = tl.to(device)
+                        # 对齐时间长度
+                        T_s = feats.size(1)
+                        T_t = tl.size(1)
+                        T_min = min(T_s, T_t)
+                        if T_min > 0:
+                            student_feats = feats[:, :T_min, :].float()
+                            teacher_feats = tl[:, :T_min, :].float()
+                            dl = distill_fn(student_feats, teacher_feats)
+                            distill_loss = dl.get('total', distill_loss)
+            # Hash regularisation and rate loss (if hash bottleneck is enabled)
+            # Hash regularisation and rate loss (if hash bottleneck is enabled)
+            hash_reg_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+            hash_rate_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
+            hash_reg_losses: Dict[str, torch.Tensor] = {}
+            if enable_hash and hash_bottleneck is not None and hash_results is not None:
+                try:
+                    hash_reg_losses = hash_bottleneck.compute_hash_regularization(
+                        hash_results['hash_logits'],
+                        hash_results['hash_bits_clean'],
+                    )
+                    # Core regularisation: balance + decorrelation + quantisation
+                    hash_reg_loss = (
+                        hash_reg_losses.get('bit_balance', hash_reg_loss)
+                        + hash_reg_losses.get('bit_decorrelation', 0.0)
+                        + hash_reg_losses.get('quantization', 0.0)
+                    )
+                    # Explicit rate term (Bernoulli KL)
+                    hash_rate_loss = hash_reg_losses.get('rate_kl', hash_rate_loss)
+                except Exception:
+                    hash_reg_losses = {}
 
             loss = (
                 wave_w * wave_loss           # 波形质量损失
+                + lambda_adv * adv_loss      # 波形对抗损失（Wave GAN）
+                + lambda_fm * fm_loss        # 判别器特征匹配损失
                 + acoustic_w * acoustic_loss # 自适应权重的声学损失
                 + semantic_w * semantic_loss # 自适应权重的语义损失
                 + cross_modal_loss           # 跨模态一致性损失
@@ -1379,6 +1808,9 @@ def train_one_epoch(
                 + balance_weight_adjusted * balance      # 🔧 调整后的MoE平衡损失
                 + router_weight_adjusted * router        # 🔧 调整后的路由一致性损失
                 + stage_cfg.anti_static_weight * anti_static  # ✅ 反静态损失
+                + hash_reg_weight * hash_reg_loss            # Hash 正则损失
+                + hash_rate_weight * hash_rate_loss          # Hash rate (KL) 损失
+                + lambda_distill * distill_loss              # StableCodec teacher 蒸馏损失
             )
             # Merge decoder-side MoE auxiliary loss (if provided, differentiable)
             try:
@@ -1388,27 +1820,41 @@ def train_one_epoch(
             except Exception:
                 pass
 
-            # Check for NaN in loss components before backward
-            if torch.isnan(loss).any():
-                print(f"⚠️ NaN detected in final loss at step {step}")
-                print(f"  recon: {recon.item():.6f}")
-                print(f"  wave_loss: {wave_loss.item():.6f}")
-                print(f"  acoustic_loss: {acoustic_loss.item():.6f}")
-                print(f"  semantic_loss: {semantic_loss.item():.6f}")
-                print(f"  cross_modal_loss: {cross_modal_loss:.6f}" if isinstance(cross_modal_loss, torch.Tensor) else f"  cross_modal_loss: {cross_modal_loss:.6f}")
-                print(f"  adaptive_weights: wave={wave_w:.2f}, acoustic={acoustic_w:.2f}, semantic={semantic_w:.2f}")
-                print(f"  balance: {balance.item():.6f}")
-                print(f"  router: {router.item():.6f}")
-                print(f"  anti_static: {anti_static.item():.6f}")
-                if 'dec_aux_loss' in locals() and dec_aux_loss is not None:
-                    print(f"  dec_aux_loss: {dec_aux_loss.item():.6f}")
-                # Replace NaN loss with small finite value that maintains gradients
-                loss = torch.tensor(0.001, device=loss.device, dtype=loss.dtype, requires_grad=True)
+            # Check for NaN in loss tensor before backward;不要脱离计算图，做数值清洗即可
+            if torch.isnan(loss).any() or torch.isinf(loss).any():
+                try:
+                    print(f"⚠️ NaN/Inf detected in final loss at step {step}; sanitizing loss")
+                except Exception:
+                    pass
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Backward pass with mixed precision
         if scaler is not None:
             # Check if loss is finite before scaling
             if torch.isfinite(loss):
+                # Optional: gradient cosine similarity between wave and acoustic branches on a probe param
+                cos_iv = int(grad_cos_interval or 0)
+                if cos_iv > 0 and (batch_idx + 1) % cos_iv == 0:
+                    probe = None
+                    try:
+                        probe = getattr(decoder.refiner, 'out_mu').weight
+                    except Exception:
+                        probe = None
+                    if probe is not None and probe.requires_grad:
+                        try:
+                            gw = torch.autograd.grad(wave_loss, probe, retain_graph=True, allow_unused=True)[0]
+                            ga = torch.autograd.grad(acoustic_loss, probe, retain_graph=True, allow_unused=True)[0]
+                            if gw is not None and ga is not None:
+                                gwf = gw.detach().flatten()
+                                gaf = ga.detach().flatten()
+                                denom = (gwf.norm() * gaf.norm()).clamp_min(1e-8)
+                                grad_cos = float((gwf * gaf).sum() / denom)
+                                try:
+                                    tqdm.write(f"[GradCos] step={step} refiner.out_mu: cos={grad_cos:+.3f}")
+                                except Exception:
+                                    print(f"[GradCos] step={step} refiner.out_mu: cos={grad_cos:+.3f}")
+                        except Exception:
+                            pass
                 scaler.scale(loss).backward()
             else:
                 print(f"⚠️ Non-finite loss detected before scaling at step {step}, skipping backward")
@@ -1420,39 +1866,6 @@ def train_one_epoch(
                 print(f"⚠️ Non-finite loss detected at step {step}, skipping backward")
                 continue
 
-        # 判别器训练步骤（每隔几步训练一次判别器）
-        if use_adversarial_loss and acoustic_adv_loss is not None and disc_optimizer is not None:
-            # 每2步训练一次判别器，避免判别器过强
-            if step % 2 == 0:
-                try:
-                    # 获取当前批次的声学特征（detached，避免影响生成器梯度）
-                    if float(getattr(train_one_epoch, '_alpha_acoustic', 0.0)) > 0.0:
-                        if 'acoustic_features' in locals():
-                            # 双头路径
-                            pred_acoustic_detached = acoustic_features.detach()
-                            target_acoustic_for_disc = acoustic_target
-                        else:
-                            # 非双头路径
-                            pred_acoustic_detached = feats[..., :20].detach()
-                            target_acoustic_for_disc = y[..., :20]
-
-                        # 计算判别器损失
-                        disc_loss, disc_metrics = acoustic_adv_loss.compute_discriminator_loss(
-                            pred_acoustic_detached, target_acoustic_for_disc
-                        )
-
-                        # 判别器反向传播
-                        disc_optimizer.zero_grad()
-                        disc_loss.backward()
-                        disc_optimizer.step()
-
-                        # 定期记录判别器指标
-                        if step % 40 == 0:
-                            print(f"🔍 Discriminator Metrics (Step {step}):")
-                            for k, v in disc_metrics.items():
-                                print(f"  {k}: {v:.6f}")
-                except Exception as e:
-                    print(f"⚠️ Discriminator training failed at step {step}: {e}")
         # --- Quick preview audio export (pred + original) ---
         if (
             out_dir is not None and
@@ -1693,6 +2106,13 @@ def train_one_epoch(
         if scaler is not None:
             # Unscale gradients before clipping for mixed precision
             scaler.unscale_(optimizer)
+        # Proactive grad sanitization: clean any NaN/Inf to zeros before diagnostics
+        try:
+            for _, param in list(encoder.named_parameters()) + list(decoder.named_parameters()):
+                if param.grad is not None:
+                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
 
         # Check for NaN/inf gradients before clipping (expensive: gated by flags)
         do_gcheck = False
@@ -1711,11 +2131,7 @@ def train_one_epoch(
                         has_nan_grad = True
 
         if has_nan_grad:
-            print(f"⚠️ Skipping optimizer step due to NaN/Inf gradients at step {step}")
-            optimizer.zero_grad(set_to_none=True)
-            if scaler is not None:
-                scaler.update()
-            continue
+            print(f"⚠️ NaN/Inf gradients detected at step {step} — grads already sanitized; continuing")
 
         total_norm = torch.nn.utils.clip_grad_norm_(
             list(encoder.parameters()) + list(decoder.parameters()), 1.0
@@ -1727,16 +2143,34 @@ def train_one_epoch(
             beta = 0.98
             train_one_epoch._gn_ema = beta * train_one_epoch._gn_ema + (1.0 - beta) * tn
 
-        # Key gradient diagnostics (FiLM focused)
+        # Key gradient diagnostics (encoder/decoder major groups + FiLM focused)
         if (batch_idx + 1) % max(1, int(log_interval)) == 0:
-            film_gn, film_n = _sum_grad_norm(encoder.named_parameters(), include_key='film')
-            # Decoder MoE grad norm
-            dec_moe_gn = 0.0
-            try:
-                if hasattr(decoder, 'dec_moe') and decoder.dec_moe is not None:
-                    dec_moe_gn, _ = _sum_grad_norm(decoder.dec_moe.named_parameters())
-            except Exception:
-                pass
+            # Prefer module-based grad norms to avoid name-prefix drift
+            actual_enc = encoder.module if hasattr(encoder, 'module') else encoder
+            actual_dec = decoder.module if hasattr(decoder, 'module') else decoder
+
+            # Encoder FiLM grad norm
+            enc_film_mod = getattr(actual_enc, 'film', None)
+            film_sq = _grad_sq_from_module(enc_film_mod)
+            film_gn = float(max(0.0, film_sq) ** 0.5)
+
+            # Decoder core/refiner/other grad norms
+            dec_core_mod = getattr(actual_dec, 'fargan_core', None)
+            dec_ref_mod = getattr(actual_dec, 'refiner', None)
+
+            dec_total_sq = _grad_sq_from_params(actual_dec.parameters())
+            dec_wave_sq = _grad_sq_from_module(dec_core_mod)
+            dec_refine_sq = _grad_sq_from_module(dec_ref_mod)
+            dec_other_sq = max(0.0, dec_total_sq - dec_wave_sq - dec_refine_sq)
+
+            dec_wave_gn = float(max(0.0, dec_wave_sq) ** 0.5)
+            dec_refine_gn = float(max(0.0, dec_refine_sq) ** 0.5)
+            dec_other_gn = float(dec_other_sq ** 0.5)
+
+            # Encoder core = all encoder minus film
+            enc_total_sq = _grad_sq_from_params(actual_enc.parameters())
+            enc_core_sq = max(0.0, enc_total_sq - film_sq)
+            enc_core_gn = float(enc_core_sq ** 0.5)
             film_info = getattr(encoder, '_last_film_stats', None)
             pre_s = film_info.get('pre_s', 0.0) if isinstance(film_info, dict) else 0.0
             post_s = film_info.get('post_s', 0.0) if isinstance(film_info, dict) else 0.0
@@ -1801,6 +2235,69 @@ def train_one_epoch(
             if 'fs' in locals() and fs is not None: ch_post['FS'] = f"{fs:.2f}"
             if 'los' in locals() and los is not None: ch_post['LOS'] = f"{los:.2f}"
 
+            # Decoder-side FiLM stats (safe retrieval)
+            try:
+                _ref = getattr(decoder, 'refiner', None)
+                if _ref is not None and hasattr(_ref, 'get_film_stats'):
+                    dec_film_info = _ref.get_film_stats() or {}
+                else:
+                    dec_film_info = {}
+            except Exception:
+                dec_film_info = {}
+
+            # C. FiLM NaN与钳制统计（编码端+解码端），便于观测
+            try:
+                if isinstance(film_info, dict) and film_info:
+                    tqdm.write(
+                        f"[FiLM/enc] nan_a={int(film_info.get('nan_count_a',0))} nan_b={int(film_info.get('nan_count_b',0))} "
+                        f"clamp_s(lo,hi)=({int(film_info.get('clamp_scale_lo',0))},{int(film_info.get('clamp_scale_hi',0))}) "
+                        f"clamp_sh(lo,hi)=({int(film_info.get('clamp_shift_lo',0))},{int(film_info.get('clamp_shift_hi',0))})"
+                    )
+                if isinstance(dec_film_info, dict) and dec_film_info:
+                    tqdm.write(
+                        f"[FiLM/dec] nan_alpha={int(dec_film_info.get('nan_count_alpha',0))} nan_beta={int(dec_film_info.get('nan_count_beta',0))} "
+                        f"pre={float(dec_film_info.get('pre',0.0)):.2f} post={float(dec_film_info.get('post',0.0)):.2f}"
+                    )
+            except Exception:
+                pass
+
+            # D. 真实可训练张量梯度范数（模块级）
+            try:
+                def _mod_grad_norm(mod: Optional[nn.Module]) -> Tuple[float, int]:
+                    if mod is None:
+                        return 0.0, 0
+                    grads = [p.grad for p in mod.parameters() if p.requires_grad and (p.grad is not None)]
+                    if not grads:
+                        return 0.0, 0
+                    dev = grads[0].device
+                    s = torch.tensor(0.0, device=dev)
+                    for g in grads:
+                        s = s + (g.detach() ** 2).sum()
+                    return float(torch.sqrt(s).item()), len(grads)
+
+                # 使用 actual_enc/actual_dec 以兼容 DP/DDP 包装
+                enc_film_mod = getattr(actual_enc, 'film', None)
+                dec_ref_mod = getattr(actual_dec, 'refiner', None)
+                dec_film_mod = getattr(dec_ref_mod, 'film', None) if dec_ref_mod is not None else None
+                dec_core_mod = getattr(actual_dec, 'fargan_core', None)
+                enc_moe_mod = getattr(actual_enc, 'moe', None)
+
+                g_enc_film, n_enc_film = _mod_grad_norm(enc_film_mod)
+                g_dec_ref,  n_dec_ref  = _mod_grad_norm(dec_ref_mod)
+                g_dec_film, n_dec_film = _mod_grad_norm(dec_film_mod)
+                g_dec_core, n_dec_core = _mod_grad_norm(dec_core_mod)
+                g_enc_moe,  n_enc_moe  = _mod_grad_norm(enc_moe_mod)
+                n_total = n_enc_film + n_dec_ref + n_dec_film + n_dec_core + n_enc_moe
+                tqdm.write(
+                    f"[Grad] enc/film={g_enc_film:.3e}(n={n_enc_film}) "
+                    f"dec/refine={g_dec_ref:.3e}(n={n_dec_ref}) "
+                    f"dec/film={g_dec_film:.3e}(n={n_dec_film}) "
+                    f"dec/core={g_dec_core:.3e}(n={n_dec_core}) "
+                    f"moe={g_enc_moe:.3e}(n={n_enc_moe}) "
+                    f"total_n={n_total}"
+                )
+            except Exception:
+                pass
             postfix = {
                 'loss': f"{float(loss.item()):.4f}",
                 'acou': f"{float(acoustic_loss.item()):.4f}",  # 20维声学损失
@@ -1811,27 +2308,17 @@ def train_one_epoch(
                 'film_pos': film_pos,
                 'a': f"{a_mean:.3f}",
                 'b': f"{b_mean:.3f}",
+                'dec_film_pre': f"{float(dec_film_info.get('pre', 0.0)):.2f}",
+                'dec_film_post': f"{float(dec_film_info.get('post', 0.0)):.2f}",
                 'rms': f"{float(pred_rms_db.item()):.1f}dB",
                 'g': f"{train_one_epoch._gn_ema:.2e}",
                 'g_film': f"{film_gn:.2e}",
-                'g_dec': f"{dec_moe_gn:.2e}"
+                'g_decWave': f"{dec_wave_gn:.2e}",
+                'g_refine': f"{dec_refine_gn:.2e}",
+                'g_enc': f"{enc_core_gn:.2e}",
+                'g_decOther': f"{dec_other_gn:.2e}",
             }
             postfix.update(ch_post)
-            # Attach semantic fusion residual gate (scale and grad)
-            try:
-                _dec_core = getattr(decoder, 'module', decoder)
-                _sf = getattr(_dec_core, 'semantic_fusion', None)
-                if _sf is not None and hasattr(_sf, 'residual_logit'):
-                    with torch.no_grad():
-                        _rscale = torch.sigmoid(_sf.residual_logit.detach()).item()
-                    _g_res = None
-                    if _sf.residual_logit.grad is not None:
-                        _g_res = float(_sf.residual_logit.grad.detach().abs().item())
-                    postfix['rscale'] = f"{_rscale:.3f}"
-                    if _g_res is not None:
-                        postfix['g_res'] = f"{_g_res:.2e}"
-            except Exception:
-                pass
             # Attach wave debug info
             try:
                 postfix['wsrc'] = str(getattr(train_one_epoch, '_feat_source', 'base'))
@@ -1843,6 +2330,63 @@ def train_one_epoch(
                 pass
             progress.set_postfix(postfix)
 
+            # W&B logging (main process only)
+            if wandb_enabled and is_main_process() and (_wandb is not None):
+                log = {
+                    'loss/total': float(loss.item()),
+                    'loss/wave': float(wave_loss.item()),
+                    'loss/acoustic': float(acoustic_loss.item()),
+                    'loss/semantic': float(semantic_loss.item()),
+                    'weight/wave': float(wave_w),
+                    'weight/acoustic': float(acoustic_w),
+                    'weight/semantic': float(semantic_w),
+                    'grad/film': float(film_gn),
+                    'grad/decWave': float(dec_wave_gn),
+                    'grad/refine': float(dec_refine_gn),
+                    'grad/enc': float(enc_core_gn),
+                    'grad/decOther': float(dec_other_gn),
+                    'film/enc_pre': float(pre_s),
+                    'film/enc_post': float(post_s),
+                    'film/enc_a_mean': float(a_mean),
+                    'film/enc_b_mean': float(b_mean),
+                    'film/enc_scale_mean': float(sc_mean),
+                    'film/enc_shift_mean': float(sh_mean),
+                    'film/dec_pre': float(dec_film_info.get('pre', 0.0) if dec_film_info else 0.0),
+                    'film/dec_post': float(dec_film_info.get('post', 0.0) if dec_film_info else 0.0),
+                    'film/dec_gain': float(dec_film_info.get('gain_scale', 0.0) if dec_film_info else 0.0),
+                    'film/dec_bias': float(dec_film_info.get('bias_scale', 0.0) if dec_film_info else 0.0),
+                    'film/dec_a_mean': float(dec_film_info.get('a_mean', 0.0) if dec_film_info else 0.0),
+                    'film/dec_b_mean': float(dec_film_info.get('b_mean', 0.0) if dec_film_info else 0.0),
+                    'audio/rms_db_pred': float(rms_db_pred.mean().item()),
+                    'audio/amp_db_delta': float((rms_db_pred - rms_db_tgt).mean().item()),
+                }
+                # Channel proxies if present
+                try:
+                    if snr_mean is not None:
+                        log['channel/SNR_dB'] = float(snr_mean)
+                    if 'ts' in locals() and ts is not None:
+                        log['channel/time_selectivity'] = float(ts)
+                    if 'fs' in locals() and fs is not None:
+                        log['channel/freq_selectivity'] = float(fs)
+                    if 'los' in locals() and los is not None:
+                        log['channel/los_ratio'] = float(los)
+                except Exception:
+                    pass
+                # Wave sub-losses if available
+                try:
+                    for k, v in (wave_details_pred or {}).items():
+                        if isinstance(v, torch.Tensor):
+                            vv = float(v.detach().item()) if v.numel()==1 else float(v.mean().item())
+                        else:
+                            vv = float(v)
+                        log[f'wave/{k}'] = vv
+                except Exception:
+                    pass
+                try:
+                    _wandb.log(log, step=step)
+                except Exception:
+                    pass
+
             # Stage3-style explicit JSCC log line via tqdm.write
             parts = [
                 f"step={step}",
@@ -1853,19 +2397,6 @@ def train_one_epoch(
                 f"bal={float((balance_weight_adjusted * balance).item()):.4f}",    # 调整后的MoE平衡损失
                 f"rout={float((router_weight_adjusted * router).item()):.4f}",     # 调整后的路由损失
             ]
-            # Append residual gate state and gradient if available
-            try:
-                _dec_core = getattr(decoder, 'module', decoder)
-                _sf = getattr(_dec_core, 'semantic_fusion', None)
-                if _sf is not None and hasattr(_sf, 'residual_logit'):
-                    with torch.no_grad():
-                        _rscale = torch.sigmoid(_sf.residual_logit.detach()).item()
-                    parts.append(f"rscale={_rscale:.3f}")
-                    if _sf.residual_logit.grad is not None:
-                        _g_res = float(_sf.residual_logit.grad.detach().abs().item())
-                        parts.append(f"g_res={_g_res:.2e}")
-            except Exception:
-                pass
             # Append present channel keys only
             if snr_mean is not None: parts.append(f"SNR={snr_mean:.1f}dB")
             if ber_mean is not None: parts.append(f"BER={ber_mean:.2e}")
@@ -1884,6 +2415,14 @@ def train_one_epoch(
             parts.append(f"scale={sc_mean:.3f}")
             parts.append(f"shift={sh_mean:.3f}")
             parts.append(f"g_film={film_gn:.2e}")
+            parts.append(f"g_decWave={dec_wave_gn:.2e}")
+            parts.append(f"g_refine={dec_refine_gn:.2e}")
+            parts.append(f"g_enc={enc_core_gn:.2e}")
+            parts.append(f"g_decOther={dec_other_gn:.2e}")
+            if dec_film_info:
+                parts.append(
+                    f"decFiLM(pre={float(dec_film_info.get('pre',0.0)):.2f}, post={float(dec_film_info.get('post',0.0)):.2f}, gain={float(dec_film_info.get('gain_scale',0.0)):.2f}, bias={float(dec_film_info.get('bias_scale',0.0)):.2f})"
+                )
             parts.append(f"g={train_one_epoch._gn_ema:.2e}")
             # Add wave debug to JSCC line
             try:
@@ -1893,33 +2432,7 @@ def train_one_epoch(
                 parts.append(f"ampd={float((rms_db_pred - rms_db_tgt).mean().item()):+.1f}dB")
             except Exception:
                 pass
-            # Decoder-side MoE stats (if available)
-            try:
-                if hasattr(decoder, 'get_dec_moe_stats'):
-                    dec_stats = decoder.get_dec_moe_stats() or {}
-                    util = dec_stats.get('util')
-                    ent = dec_stats.get('entropy')
-                    resE = dec_stats.get('residual_energy')
-                    # also attach aux losses if present
-                    try:
-                        aux = getattr(decoder, '_dec_moe_aux', {}) or {}
-                        aux_bal = aux.get('balance')
-                        aux_ent = aux.get('entropy')
-                        if torch.is_tensor(aux_bal):
-                            parts.append(f"decBal={float(aux_bal.item()):.3e}")
-                        if torch.is_tensor(aux_ent):
-                            parts.append(f"decEnt={float(aux_ent.item()):.3f}")
-                    except Exception:
-                        pass
-                    if util:
-                        util_s = ','.join(f"{u:.2f}" for u in util)
-                        parts.append(f"decU=[{util_s}]")
-                    if ent is not None:
-                        parts.append(f"decH={ent:.2f}")
-                    if resE is not None:
-                        parts.append(f"decRes={resE:.3e}")
-            except Exception:
-                pass
+            # (decoder-side MoE stats removed)
             safe_print("[JSCC] " + " | ".join(parts))
 
         if scaler is not None:
@@ -2026,6 +2539,32 @@ def main() -> int:
     parser.add_argument("--moe", action="store_true", help="Enable MoE in encoder")
     parser.add_argument("--channel", type=str, default=None, choices=["clean", "awgn", "fading"],
                         help="Channel perturbation type for Stage4 (default from StageConfig)")
+    # Hash bottleneck (Stage4+hash) controls
+    parser.add_argument("--enable-hash-bottleneck", action="store_true",
+                        help="Enable binary hash bottleneck on encoder latent (Stage4+hash path)")
+    parser.add_argument("--hash-bits", type=int, default=16,
+                        help="Number of hash bits per frame for hash bottleneck")
+    parser.add_argument("--hash-method", type=str, default="bihalf",
+                        choices=["bihalf", "greedy", "sign"],
+                        help="Hash function used inside the bottleneck")
+    parser.add_argument("--hash-channel-type", type=str, default="bsc",
+                        choices=["bsc", "bpsk_awgn", "none"],
+                        help="Channel model inside hash bottleneck (bit-level JSCC)")
+    parser.add_argument("--hash-ber", type=float, default=0.1,
+                        help="Bit error rate for BSC hash channel (if used)")
+    parser.add_argument("--hash-snr-db", type=float, default=10.0,
+                        help="SNR (dB) for BPSK+AWGN hash channel (if used)")
+    parser.add_argument("--hash-channel-start-step", type=int, default=None,
+                        help="Global step after which hash channel noise starts (defaults to channel_start_step)")
+    parser.add_argument("--hash-reg-weight", type=float, default=0.1,
+                        help="Global weight for hash regularisation loss (balance/decor/quant)")
+    parser.add_argument("--hash-rate-weight", type=float, default=0.01,
+                        help="Global weight for hash rate (Bernoulli KL) loss")
+    # StableCodec teacher distillation (offline latents)
+    parser.add_argument("--enable-stablecodec-teacher", action="store_true",
+                        help="Enable StableCodec teacher distillation (requires offline latents *.pt)")
+    parser.add_argument("--stablecodec-distill-weight", type=float, default=0.3,
+                        help="Loss weight for StableCodec teacher distillation term")
     # SNR schedule (high → low)
     parser.add_argument("--snr-hi-db", type=float, default=15.0,
                         help='Initial high-SNR center (dB), e.g., 15')
@@ -2055,8 +2594,7 @@ def main() -> int:
                         help='Revival period in steps: disable FiLM, channel and decoder MoE to let Stage3 weights recover')
     parser.add_argument("--channel-start-step", type=int, default=None,
                         help='If set, start applying channel perturbation from this global step (overrides revival)')
-    parser.add_argument("--dec-moe-start-step", type=int, default=None,
-                        help='If set, enable decoder residual MoE from this global step (overrides revival)')
+    # (decoder-side residual MoE removed)
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from a Stage4 checkpoint (.pth). If contains optimizer state, it will be restored.")
     # Preview audio export (disabled by default)
@@ -2066,6 +2604,15 @@ def main() -> int:
                         help="Max seconds per preview clip (default 10s)")
     parser.add_argument("--val-audio-deemph", type=float, default=0.85,
                         help="Preview de-emphasis factor (0 to disable; default 0.85)")
+    parser.add_argument("--use-adaptive-loss-weights", action='store_true',
+                        help='Use adaptive weighting for acoustic/semantic losses based on wave loss (default: fixed weights)')
+    parser.add_argument("--grad-cos-interval", type=int, default=0,
+                        help='If >0, compute cosine similarity between wave/acoustic gradients on a probe param every N steps')
+    # Weights & Biases logging
+    parser.add_argument("--wandb", action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument("--wandb-project", type=str, default="fargan-stage4", help='W&B project name')
+    parser.add_argument("--wandb-run-name", type=str, default=None, help='W&B run name (optional)')
+    parser.add_argument("--wandb-entity", type=str, default=None, help='W&B entity/team (optional)')
     # Warm-up (freezing) knobs
     parser.add_argument("--freeze-film-steps", type=int, default=0,
                         help="Disable FiLM for first N steps by withholding CSI from encoder/decoder")
@@ -2073,29 +2620,7 @@ def main() -> int:
                         help="Freeze encoder MoE parameters for first N steps")
     parser.add_argument("--freeze-decoder-steps", type=int, default=0,
                         help="Freeze decoder (wave head) parameters for first N steps")
-    # Decoder-side MoE knobs
-    parser.add_argument("--dec-moe", action='store_true', help='Enable decoder-side residual MoE')
-    parser.add_argument("--dec-moe-experts", type=int, default=3)
-    parser.add_argument("--dec-moe-topk", type=int, default=2)
-    parser.add_argument("--dec-moe-topk-warm-steps", type=int, default=800)
-    parser.add_argument("--dec-moe-temp-start", type=float, default=1.5)
-    parser.add_argument("--dec-moe-temp-end", type=float, default=0.7)
-    parser.add_argument("--dec-moe-temp-steps", type=int, default=1000)
-    parser.add_argument("--dec-moe-res-scale-start", type=float, default=0.1)
-    parser.add_argument("--dec-moe-res-scale-end", type=float, default=0.2)
-    parser.add_argument("--dec-moe-res-scale-steps", type=int, default=1500)
-    parser.add_argument("--dec-moe-jitter", type=float, default=5e-3)
-    # Decoder MoE routing & regularization
-    parser.add_argument("--dec-moe-router-use-csi", action='store_true', default=True,
-                        help='Use CSI proxies (snr_proxy/time_selectivity/freq_selectivity/los_ratio) in decoder MoE routing')
-    parser.add_argument("--dec-moe-balance-weight", type=float, default=0.2,
-                        help='Auxiliary balance loss weight for decoder MoE (encourages uniform expert usage)')
-    parser.add_argument("--dec-moe-entropy-weight", type=float, default=0.05,
-                        help='Early-phase entropy regularization weight for decoder MoE routing')
-    parser.add_argument("--dec-moe-entropy-warm-steps", type=int, default=800,
-                        help='Steps to linearly anneal decoder MoE entropy regularization to zero')
-    parser.add_argument("--dec-moe-prob-smoothing-eps", type=float, default=0.02,
-                        help='Probability smoothing epsilon to avoid zero gradients for tail experts')
+    # (decoder-side residual MoE CLI removed)
     # Decoder FiLM knobs (Refiner)
     parser.add_argument("--dec-film-gain-scale", type=float, default=1.0,
                         help='Decoder-side FiLM gain scale (gamma)')
@@ -2107,6 +2632,18 @@ def main() -> int:
                         help='Enable frame-level acoustic priors to drive time-varying FiLM (default: enabled)')
     parser.add_argument("--dec-film-ap-blend", type=float, default=0.5,
                         help='Blend ratio for acoustic-priors FiLM vs CSI-FiLM (0..1, default 0.5)')
+    parser.add_argument("--dec-film-pre-start", type=float, default=1.0,
+                        help='Decoder FiLM pre-stage start strength (default 1.0)')
+    parser.add_argument("--dec-film-pre-end", type=float, default=1.0,
+                        help='Decoder FiLM pre-stage target strength (default 1.0)')
+    parser.add_argument("--dec-film-pre-warmup", type=int, default=0,
+                        help='Decoder FiLM pre-stage warmup steps (default 0 = immediate)')
+    parser.add_argument("--dec-film-post-start", type=float, default=0.0,
+                        help='Decoder FiLM post-stage start strength (default 0.0 disabled)')
+    parser.add_argument("--dec-film-post-end", type=float, default=0.0,
+                        help='Decoder FiLM post-stage target strength (default 0.0 disabled)')
+    parser.add_argument("--dec-film-post-warmup", type=int, default=0,
+                        help='Decoder FiLM post-stage warmup steps (default 0)')
     # Period smoothing (vocoder robustness)
     parser.add_argument("--period-smooth-ks", type=int, default=3,
                         help='Odd kernel size for period temporal smoothing before vocoder (3=median/mean window; 1 disables)')
@@ -2130,30 +2667,20 @@ def main() -> int:
     parser.add_argument("--wave-w-subframe", type=float, default=0.05,
                         help='Wave loss: subframe alignment weight (increase to sharpen micro-textures)')
     # Pitch-guided + period teacher-forcing mix (minimal robust fix)
-    parser.add_argument("--feat-pitch-lambda", type=float, default=0.0,
-                        help='Extra MSE weight on pitch feature (dim=18) to stabilize F0 tracking (0 disables)')
     parser.add_argument("--period-tf-ratio-start", type=float, default=0.0,
                         help='Initial teacher-forced period mix ratio in wave loss (0..1); linearly anneals to 0')
     parser.add_argument("--period-tf-ratio-steps", type=int, default=1500,
                         help='Anneal steps for period TF ratio; 0 keeps constant ratio')
     parser.add_argument("--period-tf-constant", action='store_true',
                         help='If set, keep TF ratio constant at --period-tf-ratio-start (no anneal)')
-    parser.add_argument("--pitch-voiced-thresh", type=float, default=0.10,
-                        help='Voiced threshold on frame_corr (dim=19) for pitch-guided loss masking')
     # Decoder MoE light supervised routing (optional)
-    parser.add_argument("--dec-moe-trans-supervise", action='store_true',
-                        help='Bias a chosen expert when transient feature is high (early steps only)')
-    parser.add_argument("--dec-moe-trans-expert-id", type=int, default=1)
-    parser.add_argument("--dec-moe-trans-thresh", type=float, default=0.5)
-    parser.add_argument("--dec-moe-trans-bias", type=float, default=0.1)
-    parser.add_argument("--dec-moe-trans-sup-steps", type=int, default=1000)
+    # (decoder-side residual MoE transient supervision CLI removed)
     # Per-module LR multipliers for balanced co-training
     parser.add_argument("--moe-lr-mult", type=float, default=1.0,
                         help='LR multiplier for encoder.moe parameters (default 1.0)')
     parser.add_argument("--dec-wave-lr-mult", type=float, default=1.0,
                         help='LR multiplier for decoder wave head (FARGANCore+PeriodEstimator) (default 1.0)')
-    parser.add_argument("--dec-moe-lr-mult", type=float, default=1.0,
-                        help='LR multiplier for decoder.dec_moe parameters (default 1.0)')
+    # (decoder-side residual MoE LR multiplier removed)
     # 双头解码器和语义损失参数
     # 语义增强解码器控制
     parser.add_argument("--use-dual-head-decoder", action='store_true',
@@ -2165,20 +2692,26 @@ def main() -> int:
     parser.add_argument("--semantic-dropout", type=float, default=0.1,
                         help='Dropout rate for semantic enhancement network')
 
-    # 对抗损失控制
+    # 对抗损失控制（波形GAN）
     parser.add_argument("--use-adversarial-loss", action='store_true', default=True,
-                        help='Use adversarial loss for 20D acoustic features (default: True)')
+                        help='Use waveform adversarial loss (WaveDiscriminator + feature matching)')
     parser.add_argument("--no-adversarial-loss", dest='use_adversarial_loss', action='store_false',
-                        help='Disable adversarial loss, use L1 loss instead')
+                        help='Disable waveform adversarial loss')
+    parser.add_argument("--lambda-adv-wave", type=float, default=3.0,
+                        help='Weight for waveform adversarial loss term (λ_g, default 3.0)')
+    parser.add_argument("--lambda-fm-wave", type=float, default=4.0,
+                        help='Weight for waveform feature-matching loss term (λ_feat, default 4.0)')
+    parser.add_argument("--disc-update-prob", type=float, default=6.0/7.0,
+                        help='Probability to update discriminator each step (default 6/7, 1.0 for every step)')
 
     # SSL语义监督控制
     parser.add_argument("--ssl-model", type=str, default="hubert-base",
                         choices=["hubert-base", "hubert-large", "wavlm-base", "wavlm-large"],
                         help='SSL model type for semantic supervision')
-    parser.add_argument("--alpha-semantic", type=float, default=0.3,
-                        help='Weight for semantic alignment loss (match Stage3)')
-    parser.add_argument("--alpha-acoustic", type=float, default=1.0,
-                        help='Weight for acoustic features loss (20-dim, match Stage3)')
+    parser.add_argument("--alpha-semantic", type=float, default=0.7,
+                        help='Weight for semantic alignment loss (SSL/semantic head)')
+    parser.add_argument("--alpha-acoustic", type=float, default=0.1,
+                        help='Weight for acoustic feature regulariser (20-dim)')
     # 兼容Stage3的参数别名
     parser.add_argument("--alpha-sem", type=float, dest='alpha_semantic',
                         help='Alias for --alpha-semantic (Stage3 compatibility)')
@@ -2210,8 +2743,6 @@ def main() -> int:
     # 运行时语义控制
     parser.add_argument("--disable-semantic-at-runtime", action='store_true',
                         help='Disable semantic processing during forward pass (debugging)')
-    parser.add_argument("--semantic-warmup-steps", type=int, default=0,
-                        help='Steps to warmup semantic loss (0 = no warmup)')
 
     # Stage3兼容性参数：输入分流
     parser.add_argument("--split-stream-inputs", action='store_true',
@@ -2224,6 +2755,13 @@ def main() -> int:
     if args.channel is not None:
         stage_cfg.apply_channel = (args.channel != "clean")
         stage_cfg.channel_type = args.channel
+
+    # ---- Stage4 Day1 Baseline: disable MoE-specific regularisation ----
+    # Keep encoder.moe weights frozen (loaded from Stage3), but do not train or
+    # regularise them in this baseline run. This focuses optimisation on the
+    # core AETHER+FARGAN path without deleting MoE from the architecture.
+    stage_cfg.lambda_balance = 0.0
+    stage_cfg.lambda_cons = 0.0
 
     # Enable cuDNN autotuner for faster convs (safe with fixed input sizes)
     try:
@@ -2256,6 +2794,26 @@ def main() -> int:
     # Wait for main process to create directory
     if distributed_training:
         dist.barrier()
+
+    # W&B init (main process only)
+    wandb_run = None
+    try:
+        if args.wandb and is_main_process():
+            if _wandb is None:
+                safe_print("[W&B] wandb not installed; disable --wandb or install wandb")
+            else:
+                wandb_kwargs = {
+                    'project': args.wandb_project,
+                    'config': vars(args),
+                }
+                if args.wandb_run_name:
+                    wandb_kwargs['name'] = args.wandb_run_name
+                if args.wandb_entity:
+                    wandb_kwargs['entity'] = args.wandb_entity
+                wandb_run = _wandb.init(**wandb_kwargs)
+                safe_print(f"[W&B] Logging enabled: project={args.wandb_project} name={args.wandb_run_name}")
+    except Exception as _e:
+        safe_print(f"[W&B] init failed: {_e}")
 
     # JSCC-focused run summary
     safe_print("=" * 60)
@@ -2439,8 +2997,19 @@ def main() -> int:
     # Keep latent quantization in Stage4
     encoder.quantize_latent = True
 
+    # Stage4 Day1 baseline: freeze encoder.moe parameters so MoE acts as a
+    # fixed Stage3 module and does not receive gradients in this run.
+    try:
+        if hasattr(encoder, "moe") and encoder.moe is not None:
+            for p in encoder.moe.parameters():
+                p.requires_grad = False
+            safe_print("[Stage4/Baseline] encoder.moe parameters frozen")
+    except Exception:
+        pass
+
     # 创建解码器：根据参数选择语义增强或传统解码器
-    enable_semantic = args.enable_semantic_augmentation or args.use_dual_head_decoder  # 向下兼容
+    # Baseline: 强制使用传统 AETHER-FARGAN 解码器，暂不启用语义增强路径
+    enable_semantic = False
 
     if enable_semantic:
         from models.semantic_augmented_aether_decoder import SemanticAugmentedAETHERDecoder
@@ -2527,64 +3096,30 @@ def main() -> int:
     # Ensure decoder-side calibration starts from identity for safety
     _set_decoder_identity_calib(decoder)
     # Configure decoder-side residual MoE if available
-    try:
-        if hasattr(decoder, 'dec_moe') and decoder.dec_moe is not None:
-            decoder.enable_dec_moe = bool(args.dec_moe)
-            decoder.dec_moe.n_experts = int(args.dec_moe_experts)
-            decoder.dec_moe.top_k = int(args.dec_moe_topk)
-            decoder.dec_moe.topk_warm_steps = int(args.dec_moe_topk_warm_steps)
-            decoder.dec_moe.temp_start = float(args.dec_moe_temp_start)
-            decoder.dec_moe.temp_end = float(args.dec_moe_temp_end)
-            decoder.dec_moe.temp_steps = int(args.dec_moe_temp_steps)
-            decoder.dec_moe.res_scale_start = float(args.dec_moe_res_scale_start)
-            decoder.dec_moe.res_scale_end = float(args.dec_moe_res_scale_end)
-            decoder.dec_moe.res_scale_steps = int(args.dec_moe_res_scale_steps)
-            decoder.dec_moe.jitter_std = float(args.dec_moe_jitter)
-            # Routing & aux regularization
-            decoder.dec_moe.router_use_csi = bool(args.dec_moe_router_use_csi)
-            decoder.dec_moe.balance_weight = float(args.dec_moe_balance_weight)
-            decoder.dec_moe.entropy_weight = float(args.dec_moe_entropy_weight)
-            decoder.dec_moe.entropy_warm_steps = int(args.dec_moe_entropy_warm_steps)
-            decoder.dec_moe.prob_smoothing_eps = float(args.dec_moe_prob_smoothing_eps)
-            # Light supervision knobs
-            decoder.dec_moe.supervise_transient = bool(args.dec_moe_trans_supervise)
-            decoder.dec_moe.transient_expert_id = int(args.dec_moe_trans_expert_id)
-            decoder.dec_moe.trans_thresh = float(args.dec_moe_trans_thresh)
-            decoder.dec_moe.trans_bias = float(args.dec_moe_trans_bias)
-            decoder.dec_moe.trans_sup_steps = int(args.dec_moe_trans_sup_steps)
-            safe_print(
-                f"Decoder MoE: enabled={decoder.enable_dec_moe} | E={decoder.dec_moe.n_experts} "
-                f"TopK={decoder.dec_moe.top_k} warm={decoder.dec_moe.topk_warm_steps} "
-                f"tau={decoder.dec_moe.temp_start}->{decoder.dec_moe.temp_end} in {decoder.dec_moe.temp_steps} "
-                f"res={decoder.dec_moe.res_scale_start}->{decoder.dec_moe.res_scale_end} in {decoder.dec_moe.res_scale_steps} "
-                f"jitter={decoder.dec_moe.jitter_std} "
-                f"router_csi={decoder.dec_moe.router_use_csi} balW={decoder.dec_moe.balance_weight} entW={decoder.dec_moe.entropy_weight} "
-                f"entWarm={decoder.dec_moe.entropy_warm_steps} smooth={decoder.dec_moe.prob_smoothing_eps} "
-                f"supT={decoder.dec_moe.supervise_transient} (eid={decoder.dec_moe.transient_expert_id}, thresh={decoder.dec_moe.trans_thresh}, "
-                f"bias={decoder.dec_moe.trans_bias}, steps={decoder.dec_moe.trans_sup_steps})"
-            )
-    except Exception as e:
-        safe_print(f"[WARN] Failed to configure decoder MoE: {e}")
+    # (decoder-side residual MoE removed)
 
     safe_print(f"Model config: d_csi={d_csi_effective}, n_experts={n_experts}, top_k={top_k}, "
                f"quant={encoder.use_quantization}({encoder.latent_bits}b), film={encoder.use_film}, pos={encoder.film_position}")
 
-    # 初始化对抗损失模块（用于20维声学特征）
+    # ---- Fix FiLM clamp: provide sane ranges to avoid constant projection (B) ----
+    try:
+        if hasattr(encoder, 'film') and hasattr(encoder.film, 'set_clamp'):
+            # Allow moderate multiplicative delta and additive shift
+            encoder.film.set_clamp(scale_lo=-1.5, scale_hi=1.5, shift_lo=-0.5, shift_hi=0.5)
+        # Decoder refiner FiLM clamp follows CLI scaling for gain; keep shift symmetric
+        _refiner = getattr(decoder, 'refiner', None)
+        if _refiner is not None and hasattr(_refiner, 'film') and hasattr(_refiner.film, 'set_clamp'):
+            gain = float(getattr(args, 'dec_film_gain_scale', 1.0))
+            _refiner.film.set_clamp(scale_lo=-gain, scale_hi=+gain, shift_lo=-0.5, shift_hi=0.5)
+    except Exception as _e:
+        safe_print(f"[WARN] FiLM clamp setup skipped: {_e}")
+
+    # 初始化对抗损失模块（切换为波形判别器）
     use_adversarial_loss = getattr(args, 'use_adversarial_loss', True)
     if use_adversarial_loss:
-        acoustic_adv_loss = create_acoustic_adversarial_loss(
-            input_dim=20,
-            device=device,
-            hidden_dim=64,
-            num_layers=3,
-            recon_weight=1.0,
-            adv_weight=0.1,
-            use_gradient_penalty=True,
-            label_smoothing=0.1
-        )
-        # 为判别器创建独立的优化器（在lr定义之后创建）
+        acoustic_adv_loss = WaveDiscriminator().to(device)  # 这里复用变量名存放波形判别器
         disc_optimizer = None  # 将在lr定义后再创建
-        safe_print(f"✅ Acoustic adversarial loss initialized with {sum(p.numel() for p in acoustic_adv_loss.discriminator.parameters()):,} discriminator parameters")
+        safe_print(f"✅ Wave discriminator initialised with {sum(p.numel() for p in acoustic_adv_loss.parameters()):,} parameters")
     else:
         acoustic_adv_loss = None
         disc_optimizer = None
@@ -2617,6 +3152,15 @@ def main() -> int:
                 decoder.refiner.use_acoustic_priors = bool(getattr(args, 'dec_film_use_acoustic_priors', True))
             if hasattr(decoder.refiner, 'ap_blend'):
                 decoder.refiner.ap_blend = float(getattr(args, 'dec_film_ap_blend', 0.5))
+            if hasattr(decoder.refiner, 'configure_film_schedule'):
+                decoder.refiner.configure_film_schedule(
+                    pre_start=float(getattr(args, 'dec_film_pre_start', 1.0)),
+                    pre_end=float(getattr(args, 'dec_film_pre_end', 1.0)),
+                    pre_warmup=int(getattr(args, 'dec_film_pre_warmup', 0) or 0),
+                    post_start=float(getattr(args, 'dec_film_post_start', 0.0)),
+                    post_end=float(getattr(args, 'dec_film_post_end', 0.0)),
+                    post_warmup=int(getattr(args, 'dec_film_post_warmup', 0) or 0),
+                )
             safe_print(f"Decoder Refiner FiLM: gain_scale={getattr(decoder.refiner, 'film_gain_scale', None)} bias_scale={getattr(decoder.refiner, 'film_bias_scale', None)}")
         # Period smoothing knobs on vocoder path
         if hasattr(decoder, 'period_smooth_ks'):
@@ -2654,14 +3198,36 @@ def main() -> int:
 
     lr = stage_cfg.learning_rate
 
+    # === Optional Hash Bottleneck (Stage4+hash path) =========================================
+    hash_bottleneck: Optional[HashBottleneck] = None
+    if bool(getattr(args, 'enable_hash_bottleneck', False)):
+        try:
+            hash_bottleneck = HashBottleneck(
+                input_dim=24,                     # encoder dz
+                hash_bits=int(getattr(args, 'hash_bits', 16)),
+                decoder_hidden=128,
+                output_dim=24,
+                hash_method=str(getattr(args, 'hash_method', 'bihalf')),
+                channel_type=str(getattr(args, 'hash_channel_type', 'bsc')),
+            ).to(device)
+            safe_print(
+                f"🔥 Hash bottleneck enabled: bits/frame={hash_bottleneck.hash_bits}, "
+                f"method={hash_bottleneck.hash_method}, channel={hash_bottleneck.channel_type}"
+            )
+        except Exception as _e:
+            hash_bottleneck = None
+            safe_print(f"[WARN] Failed to init hash bottleneck, disabling: {_e}")
+    else:
+        safe_print("Hash bottleneck disabled (standard Stage4 JSCC path)")
+
     # 创建判别器优化器（如果启用对抗损失）
     if use_adversarial_loss and acoustic_adv_loss is not None:
         disc_optimizer = optim.Adam(
-            acoustic_adv_loss.discriminator.parameters(),
+            [p for p in acoustic_adv_loss.parameters() if p.requires_grad],
             lr=lr * 0.5,  # 判别器学习率稍低
-            betas=(0.5, 0.9)   # GAN训练推荐参数
+            betas=(0.5, 0.9),   # GAN训练推荐参数
         )
-        safe_print(f"✅ Discriminator optimizer created with lr={lr * 0.5:.2e}")
+        safe_print(f"✅ Wave discriminator optimizer created with lr={lr * 0.5:.2e}")
 
     # Build param groups with FiLM-specific LR/WD and per-module multipliers
     def split_film_params(module: nn.Module):
@@ -2690,15 +3256,13 @@ def main() -> int:
         else:
             enc_rest.append(p)
 
-    dec_wave, dec_moe_params, dec_rest = [], [], []
+    dec_wave, dec_rest = [], []
     dec_actual = decoder.module if hasattr(decoder, 'module') else decoder
     for n, p in dec_actual.named_parameters():
         if not p.requires_grad or ('film' in n.lower()):
             continue
         if n.startswith('fargan_core.') or n.startswith('period_estimator.'):
             dec_wave.append(p)
-        elif n.startswith('dec_moe.'):
-            dec_moe_params.append(p)
         else:
             dec_rest.append(p)
     param_groups = []
@@ -2710,8 +3274,7 @@ def main() -> int:
         param_groups.append({"params": dec_rest, "lr": lr, "weight_decay": 1e-6})
     if dec_wave:
         param_groups.append({"params": dec_wave, "lr": lr * float(getattr(args, 'dec_wave_lr_mult', 1.0)), "weight_decay": 1e-6})
-    if dec_moe_params:
-        param_groups.append({"params": dec_moe_params, "lr": lr * float(getattr(args, 'dec_moe_lr_mult', 1.0)), "weight_decay": 1e-6})
+    # (decoder-side MoE param group removed)
     if enc_film:
         param_groups.append({"params": enc_film, "lr": lr * float(args.film_lr_mult), "weight_decay": float(args.film_wd)})
     if dec_film:
@@ -2727,12 +3290,23 @@ def main() -> int:
             safe_print("Adapter params added to optimizer (lr x0.1, wd=0)")
         except Exception:
             pass
+    # 附加 Hash bottleneck 参数组（与主干相同 lr/wd）
+    if hash_bottleneck is not None:
+        try:
+            param_groups.append({
+                'params': [p for p in hash_bottleneck.parameters() if p.requires_grad],
+                'lr': lr,
+                'weight_decay': 1e-6,
+            })
+            safe_print("Hash bottleneck params added to optimizer")
+        except Exception as _e:
+            safe_print(f"[WARN] Failed to add hash bottleneck params to optimizer: {_e}")
     optimizer = optim.AdamW(param_groups)
     safe_print(
         f"Param groups -> enc_rest={len(enc_rest)} enc_moe={len(enc_moe)} dec_rest={len(dec_rest)} "
-        f"dec_wave={len(dec_wave)} dec_moe={len(dec_moe_params)} | film(enc={len(enc_film)},dec={len(dec_film)}) | "
+        f"dec_wave={len(dec_wave)} | film(enc={len(enc_film)},dec={len(dec_film)}) | "
         f"lr: base={lr:g} film_x={args.film_lr_mult} moe_x={getattr(args,'moe_lr_mult',1.0)} "
-        f"decWave_x={getattr(args,'dec_wave_lr_mult',1.0)} decMoe_x={getattr(args,'dec_moe_lr_mult',1.0)} wd_film={args.film_wd}"
+        f"decWave_x={getattr(args,'dec_wave_lr_mult',1.0)} wd_film={args.film_wd}"
     )
 
     # Multi-GPU setup: support both DataParallel and DistributedDataParallel
@@ -2740,35 +3314,12 @@ def main() -> int:
         # Use DistributedDataParallel for multi-GPU/multi-node training
         if is_main_process():
             safe_print(f"✅ Using DistributedDataParallel on {world_size} processes")
+        encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank)
+        decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank)
 
-        # Fix for semantic augmentation: prevent duplicate parameter references
-        def fix_parameter_sharing(model):
-            """Prevent duplicate parameter references that cause DDP issues"""
-            if hasattr(model, '_expose_fargan_components'):
-                # Replace the _expose_fargan_components method to prevent duplicate references
-                original_expose = getattr(model, '_expose_fargan_components', None)
-
-                def safe_expose_fargan_components():
-                    """Safe version that doesn't create duplicate references"""
-                    # Only expose if fargan_core doesn't already exist
-                    if not hasattr(model, 'fargan_core'):
-                        if original_expose:
-                            original_expose()
-                    else:
-                        # Remove any duplicate reference created
-                        if hasattr(model, 'synth') and hasattr(model.synth, 'fargan_core'):
-                            if hasattr(model, 'fargan_core') and model.fargan_core is model.synth.fargan_core:
-                                delattr(model, 'fargan_core')
-
-                # Replace the method
-                setattr(model, '_expose_fargan_components', safe_expose_fargan_components)
-                safe_print("✅ Fixed semantic augmentation parameter sharing for DDP compatibility")
-
-        fix_parameter_sharing(decoder)
-
-        # Use find_unused_parameters=True to handle dynamic graph with unused parameters
-        encoder = DistributedDataParallel(encoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
-        decoder = DistributedDataParallel(decoder, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        # Fix for parameter sharing issue: set static graph to avoid "marked ready twice" error
+        encoder._set_static_graph()
+        decoder._set_static_graph()
     elif args.data_parallel and device.type == 'cuda' and torch.cuda.device_count() > 1:
         # Use simple DataParallel for single-node, multi-GPU training
         safe_print(f"✅ Using DataParallel on {torch.cuda.device_count()} GPUs")
@@ -2884,9 +3435,36 @@ def main() -> int:
                 setattr(train_one_epoch, 'freeze_film_steps', revival)
         # Channel/dec_moe start steps
         ch_start = int(getattr(args, 'channel_start_step', revival if revival > 0 else 0) or 0)
-        dm_start = int(getattr(args, 'dec_moe_start_step', revival if revival > 0 else 0) or 0)
         setattr(train_one_epoch, '_channel_start_step', ch_start)
-        setattr(train_one_epoch, '_dec_moe_start_step', dm_start)
+
+        # Hash bottleneck runtime configuration for train_one_epoch
+        setattr(train_one_epoch, '_enable_hash_bottleneck', bool(getattr(args, 'enable_hash_bottleneck', False)))
+        setattr(train_one_epoch, '_hash_channel_type', str(getattr(args, 'hash_channel_type', 'bsc')))
+        setattr(train_one_epoch, '_hash_ber', float(getattr(args, 'hash_ber', 0.1)))
+        setattr(train_one_epoch, '_hash_snr_db', float(getattr(args, 'hash_snr_db', 10.0)))
+        h_start = getattr(args, 'hash_channel_start_step', None)
+        if h_start is None:
+            h_start = ch_start
+        setattr(train_one_epoch, '_hash_channel_start_step', int(h_start or 0))
+        setattr(train_one_epoch, '_hash_reg_weight', float(getattr(args, 'hash_reg_weight', 0.1)))
+        setattr(train_one_epoch, '_hash_rate_weight', float(getattr(args, 'hash_rate_weight', 0.01)))
+
+        # StableCodec teacher distillation config
+        enable_sc_teacher = bool(getattr(args, 'enable_stablecodec_teacher', False))
+        distill_weight = float(getattr(args, 'stablecodec_distill_weight', 0.0))
+        if enable_sc_teacher and distill_weight > 0.0:
+            try:
+                distill_fn = StableCodecDistillationLoss().to(device)
+                setattr(train_one_epoch, '_stablecodec_distill_fn', distill_fn)
+                setattr(train_one_epoch, '_stablecodec_distill_weight', distill_weight)
+                safe_print(f"StableCodec teacher distillation enabled (weight={distill_weight})")
+            except Exception as _e:
+                setattr(train_one_epoch, '_stablecodec_distill_fn', None)
+                setattr(train_one_epoch, '_stablecodec_distill_weight', 0.0)
+                safe_print(f"[WARN] Failed to init StableCodecDistillationLoss: {_e}")
+        else:
+            setattr(train_one_epoch, '_stablecodec_distill_fn', None)
+            setattr(train_one_epoch, '_stablecodec_distill_weight', 0.0)
 
         # 设置双头解码器和语义Teacher相关的标志
         setattr(train_one_epoch, '_use_dual_head', args.use_dual_head_decoder)
@@ -2898,6 +3476,10 @@ def main() -> int:
         setattr(train_one_epoch, '_alpha_semantic', float(args.alpha_semantic))
         setattr(train_one_epoch, '_semantic_loss_type', str(args.semantic_loss_type))
         setattr(train_one_epoch, '_semantic_teacher', str(args.semantic_teacher))
+        # Wave GAN loss weights
+        setattr(train_one_epoch, '_lambda_adv', float(getattr(args, 'lambda_adv_wave', 3.0)))
+        setattr(train_one_epoch, '_lambda_fm', float(getattr(args, 'lambda_fm_wave', 4.0)))
+        setattr(train_one_epoch, '_disc_update_prob', float(getattr(args, 'disc_update_prob', 6.0/7.0)))
         # Semantic loss advanced knobs: keep internal defaults, but allow compact CLI override via --semantic-advanced
         try:
             adv = getattr(args, 'semantic_advanced', None)
@@ -2941,8 +3523,6 @@ def main() -> int:
 
         # Set pitch-guided lambda, voiced mask threshold and TF ratio BEFORE the epoch begins
         try:
-            setattr(train_one_epoch, '_feat_pitch_lambda', float(getattr(args, 'feat_pitch_lambda', 0.0) or 0.0))
-            setattr(train_one_epoch, '_pitch_voiced_thresh', float(getattr(args, 'pitch_voiced_thresh', 0.10) or 0.0))
             r0 = float(getattr(args, 'period_tf_ratio_start', 0.0) or 0.0)
             n = int(getattr(args, 'period_tf_ratio_steps', 0) or 0)
             if bool(getattr(args, 'period_tf_constant', False)):
@@ -2993,10 +3573,14 @@ def main() -> int:
                 'subframe_alignment': float(args.wave_w_subframe),
             },
             scaler=scaler,
+            use_adaptive_loss_weights=bool(getattr(args, 'use_adaptive_loss_weights', False)),
+            grad_cos_interval=int(getattr(args, 'grad_cos_interval', 0) or 0),
+            wandb_enabled=bool(getattr(args, 'wandb', False)),
+            disable_semantic_runtime=bool(getattr(args, 'disable_semantic_at_runtime', False)),
+            hash_bottleneck=hash_bottleneck,
         )
         # Update epoch-local knobs for pitch-guided feature loss and TF ratio anneal
         try:
-            setattr(train_one_epoch, '_feat_pitch_lambda', float(args.feat_pitch_lambda))
             r0 = float(args.period_tf_ratio_start)
             n = max(0, int(args.period_tf_ratio_steps))
             if r0 > 0.0:
@@ -3047,3 +3631,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    # B. 打印最终合并的CLI配置（last-in-wins 视图）
+    if is_main_process():
+        try:
+            merged = vars(args).copy()
+            print("\n🧾 Final CLI args (last-in-wins):")
+            print(json.dumps(merged, indent=2, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            pass

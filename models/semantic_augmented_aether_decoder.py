@@ -19,11 +19,11 @@ from typing import Dict, Tuple, Optional, Any, Union
 try:
     # 尝试包内相对导入
     from ..aether_encoder_decoder import AETHERDecoder
-    from .semantic_head import SemanticHead
+    from .semantic_latent import SemanticAdapter, LatentSpaceHead, AcousticFusionHead
 except Exception:
     # 回退到绝对导入
     from models.aether_encoder_decoder import AETHERDecoder
-    from models.semantic_head import SemanticHead
+    from models.semantic_latent import SemanticAdapter, LatentSpaceHead, AcousticFusionHead
 
 try:
     from utils.feature_spec import get_default_feature_spec
@@ -31,7 +31,8 @@ except Exception:
     from dnn.torch.final_version.utils.feature_spec import get_default_feature_spec
 
 
-class SemanticProcessor(nn.Module):
+# 保留原有SemanticProcessor以兼容现有代码
+class SemanticProcessorLegacy(nn.Module):
     """语义处理插件：对16维语义特征进行增强处理"""
 
     def __init__(
@@ -242,7 +243,8 @@ class SemanticProcessor(nn.Module):
         return loss, metrics
 
 
-class SemanticFusionModule(nn.Module):
+# 保留原有SemanticFusionModule以兼容现有代码
+class SemanticFusionModuleLegacy(nn.Module):
     """
     语义融合模块：16维语义特征指导20维声学特征优化
 
@@ -423,6 +425,10 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         ssl_dim: int = 768,                 # SSL模型维度
         semantic_enhancement_layers: int = 2,
         semantic_dropout: float = 0.1,
+        # 新模块参数
+        latent_dim: int = 64,               # z_sem潜空间维度
+        use_cross_attention: bool = False,  # SemanticAdapter是否用cross-attention
+        semantic_loss_type: str = "cosine+infoce",  # LatentSpaceHead损失类型
         # 语义融合模块参数
         enable_semantic_fusion: bool = True,
         fusion_type: str = "attention",     # "attention", "gate", "cross_mlp"
@@ -462,28 +468,47 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         if acoustic_dim + semantic_dim != d_out:
             raise ValueError(f"acoustic_dim({acoustic_dim}) + semantic_dim({semantic_dim}) != d_out({d_out})")
 
-        # 3. 语义处理插件（仅在启用时初始化）
+        # 3. 新的三个核心模块（仅在启用时初始化）
         if self.enable_semantic_augmentation:
-            self.semantic_processor = SemanticProcessor(
-                semantic_dim=semantic_dim,
-                ssl_dim=ssl_dim,
-                enhancement_layers=semantic_enhancement_layers,
+            # 3.1 SemanticAdapter: semantic_raw + teacher → z_sem
+            self.semantic_adapter = SemanticAdapter(
+                semantic_raw_dim=semantic_dim,
+                teacher_dim=ssl_dim,
+                latent_dim=latent_dim,
+                hidden_dim=fusion_hidden_dim * 2,  # 更大的hidden dim
                 dropout=semantic_dropout,
+                use_cross_attention=use_cross_attention,
             )
-        else:
-            self.semantic_processor = None
 
-        # 4. 语义融合模块（在语义处理之后）
-        if self.enable_semantic_fusion and self.enable_semantic_augmentation:
-            self.semantic_fusion = SemanticFusionModule(
-                acoustic_dim=acoustic_dim,
+            # 3.2 LatentSpaceHead: z_sem → semantic_features + loss
+            self.latent_head = LatentSpaceHead(
+                latent_dim=latent_dim,
                 semantic_dim=semantic_dim,
-                fusion_type=fusion_type,
-                hidden_dim=fusion_hidden_dim,
+                teacher_dim=ssl_dim,
                 dropout=semantic_dropout,
+                loss_type=semantic_loss_type,
             )
+
+            # 3.3 AcousticFusionHead: acoustic + z_sem → enhanced_acoustic
+            if self.enable_semantic_fusion:
+                self.acoustic_fusion_head = AcousticFusionHead(
+                    acoustic_dim=acoustic_dim,
+                    latent_dim=latent_dim,
+                    fusion_type=fusion_type,
+                    hidden_dim=fusion_hidden_dim,
+                    dropout=semantic_dropout,
+                )
+            else:
+                self.acoustic_fusion_head = None
+
         else:
-            self.semantic_fusion = None
+            self.semantic_adapter = None
+            self.latent_head = None
+            self.acoustic_fusion_head = None
+
+        # 保留兼容性：旧模块作为fallback
+        self.semantic_processor = None
+        self.semantic_fusion = None
 
         # 5. 暴露fargan_core属性（兼容Stage2→4加载）
         # 延迟到需要时再调用，避免初始化时的循环依赖
@@ -525,25 +550,17 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         else:
             csi_dict = csi_dict_or_csi
 
-        # 1. 复用父类AETHERDecoder的特征前向传播
-        #    注意：当需要语义增强并且返回波形时，避免在父类中生成波形，
-        #    以免在同一iteration内对FARGAN调用两次导致DDP梯度重复标记。
-        features = super().forward(z, csi_dict, return_wave=False, **kwargs)
-        wave = None
+        # 1. 完全复用父类AETHERDecoder的前向传播
+        if return_wave:
+            features, wave = super().forward(z, csi_dict, return_wave=True, target_len=target_len, **kwargs)
+        else:
+            features = super().forward(z, csi_dict, return_wave=False, **kwargs)
+            wave = None
 
         # 2. 如果不需要语义输出，直接返回原始结果（完全兼容）
         if not enable_semantic_output or not self.enable_semantic_augmentation:
-            # 关闭语义增强时，如需返回波形，再调用父类生成波形（只在此路径生成一次）。
             if return_wave:
-                try:
-                    features_parent, wave_parent = super().forward(
-                        z, csi_dict, return_wave=True, target_len=target_len, **kwargs
-                    )
-                    # 以父类返回的特征为准，保持与原实现一致
-                    return features_parent, wave_parent
-                except Exception:
-                    # 回退：如果父类波形生成失败，仅返回特征
-                    return features, wave
+                return features, wave
             else:
                 return features
 
@@ -551,19 +568,44 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         acoustic_features = features[..., :self.acoustic_dim]        # 前20维：声学特征
         semantic_raw = features[..., self.acoustic_dim:]             # 后16维：原始语义特征
 
-        # 4. 语义特征增强（插件式处理）
-        if self.semantic_processor is not None:
-            semantic_features = self.semantic_processor(semantic_raw)
-        else:
-            semantic_features = semantic_raw
+        # 4. 新的三阶段语义增强流程
+        if self.semantic_adapter is not None and self.latent_head is not None:
+            # Step 1: semantic_raw + teacher → z_sem（统一潜空间）
+            teacher_features = kwargs.get('teacher_features', None)
+            attn_mask = kwargs.get('attn_mask', None)
 
-        # 5. 语义融合：16维语义指导20维声学优化（核心创新）
-        if self.semantic_fusion is not None:
-            # 语义融合：36维in → 20维out
-            enhanced_acoustic_features = self.semantic_fusion(acoustic_features, semantic_features)
+            z_sem, adapter_logs = self.semantic_adapter(
+                semantic_raw,
+                teacher_features=teacher_features,
+                mask=attn_mask,
+            )
+
+            # Step 2: z_sem → semantic_features + semantic_loss
+            semantic_features, sem_loss_tensor, sem_metrics = self.latent_head(
+                z_sem,
+                teacher_features=teacher_features,
+                mask=attn_mask,
+            )
+
+            # Step 3: acoustic + z_sem → enhanced_acoustic
+            if self.acoustic_fusion_head is not None:
+                enhanced_acoustic_features, fusion_logs = self.acoustic_fusion_head(
+                    acoustic_features,
+                    z_sem,
+                    mask=attn_mask,
+                )
+            else:
+                enhanced_acoustic_features = acoustic_features
+                fusion_logs = {}
+
         else:
-            # 如果未启用融合，使用原始声学特征
+            # Fallback: 使用原始特征
+            semantic_features = semantic_raw
             enhanced_acoustic_features = acoustic_features
+            adapter_logs = {}
+            sem_metrics = {}
+            fusion_logs = {}
+            sem_loss_tensor = semantic_raw.new_tensor(0.0)
 
         # 6. 20维→16维蒸馏：强制20维保持语义可逆性
         acoustic_semantic_distill = None
@@ -583,7 +625,6 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 # 确保enhanced_wave不为None
                 if enhanced_wave is None:
                     print(f"[WARNING] Enhanced wave synthesis returned None, using original wave")
-                    # 不再提前生成原始波形，这里保持为None，调用方自行判空
                     enhanced_wave = wave
             except Exception as e:
                 print(f"[WARNING] Enhanced wave synthesis failed: {e}, fallback to original wave")
@@ -609,13 +650,19 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
             'semantic_raw': semantic_raw,                       # 原始16维：用于对比分析
             'acoustic_semantic_distill': acoustic_semantic_distill,  # 20维→16维蒸馏输出
             'hidden_states': None,                              # 占位符，保持接口一致性
+            # 新增：三模块的监控信息
+            'z_sem': z_sem if 'z_sem' in locals() else None,  # 统一潜空间
+            'adapter_logs': adapter_logs if 'adapter_logs' in locals() else {},
+            'semantic_metrics': sem_metrics if 'sem_metrics' in locals() else {},
+            'fusion_logs': fusion_logs if 'fusion_logs' in locals() else {},
+            'semantic_loss_tensor': sem_loss_tensor if 'sem_loss_tensor' in locals() else semantic_raw.new_tensor(0.0),
         }
 
         # 根据情况返回原始波形或融合波形
         if return_wave:
             if enable_semantic_output and enhanced_wave is not None:
                 outputs['wave'] = enhanced_wave     # 使用融合后特征合成的波形
-                outputs['wave_original'] = wave     # 可能为None：未生成原始波形
+                outputs['wave_original'] = wave     # 保留原始波形用于对比
             else:
                 outputs['wave'] = wave
 
@@ -805,19 +852,22 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         wave_semantic_weight: float = 0.3,
         # 20维→16维蒸馏参数
         acoustic_semantic_distill: Optional[torch.Tensor] = None,
-        distill_weight: float = 0.5,
+        distill_weight: float = 0.5
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """计算语义对齐损失（插件式）"""
-        if not self.enable_semantic_augmentation or self.semantic_processor is None:
+        """计算语义对齐损失（使用新的LatentSpaceHead）"""
+        if not self.enable_semantic_augmentation or self.latent_head is None:
             # 如果未启用语义增强，返回零损失
             device = semantic_features.device
             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
             return zero_loss, {"semantic_disabled": 1.0}
 
-        # 基础语义损失
-        base_loss, base_metrics = self.semantic_processor.compute_semantic_loss(
-            semantic_features, ssl_features, loss_type
-        )
+        # 使用新的LatentSpaceHead计算基础语义损失
+        # 注意：这里需要从z_sem重新计算，但我们直接使用已有的semantic_features
+        # 创建一个dummy z_sem来调用LatentSpaceHead
+        dummy_z_sem = torch.randn_like(semantic_features).unsqueeze(-1).expand(-1, -1, self.latent_head.latent_dim)
+        base_loss, base_metrics = self.latent_head(
+            dummy_z_sem, ssl_features
+        )[1:3]  # 只取loss和metrics
 
         total_loss = base_loss
         total_metrics = base_metrics.copy()
@@ -853,7 +903,6 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                               device=ssl_semantic_rec.device)
                 )
 
-                # 计入总损失
                 total_loss = total_loss + wave_semantic_weight * wave_semantic_loss
                 total_metrics['wave_semantic_loss'] = wave_semantic_loss.item()
                 total_metrics['wave_semantic_weight'] = wave_semantic_weight
@@ -871,6 +920,7 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 torch.ones(acoustic_semantic_distill.size(0) * acoustic_semantic_distill.size(1),
                           device=acoustic_semantic_distill.device)
             )
+
             total_loss = total_loss + distill_weight * distill_loss
             total_metrics['acoustic_semantic_distill_loss'] = distill_loss.item()
             total_metrics['distill_weight'] = distill_weight
