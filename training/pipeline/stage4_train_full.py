@@ -3380,7 +3380,6 @@ def main() -> int:
 
         # 🔧 设置静态图以启用 DDP 静态图优化（encoder + decoder）
         try:
-            encoder._set_static_graph()
             decoder._set_static_graph()
         except Exception:
             pass
