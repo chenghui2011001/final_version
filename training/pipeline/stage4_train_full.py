@@ -1319,16 +1319,17 @@ def train_one_epoch(
                                 print(f"[WARNING] Enhanced wave synthesis not available, falling back to standard synthesis")
                         except Exception:
                             pass
-                        # 回退到标准合成
-                        if revival_active or dec_safe_fp32:
-                            try:
-                                from torch.amp import autocast as _ab_autocast
-                                with _ab_autocast('cuda', enabled=False):
+                        # 回退到标准合成 🔧 使用no_grad避免DDP参数重复标记
+                        with torch.no_grad():
+                            if revival_active or dec_safe_fp32:
+                                try:
+                                    from torch.amp import autocast as _ab_autocast
+                                    with _ab_autocast('cuda', enabled=False):
+                                        fallback_out = decoder(z.float(), dec_csi, return_wave=True, target_len=audio.size(-1))
+                                except Exception:
                                     fallback_out = decoder(z.float(), dec_csi, return_wave=True, target_len=audio.size(-1))
-                            except Exception:
-                                fallback_out = decoder(z.float(), dec_csi, return_wave=True, target_len=audio.size(-1))
-                        else:
-                            fallback_out = decoder(z, dec_csi, return_wave=True, target_len=audio.size(-1))
+                            else:
+                                fallback_out = decoder(z, dec_csi, return_wave=True, target_len=audio.size(-1))
                         _, wav = _normalize_decoder_output(fallback_out)
                         if wav is not None:
                             wav = torch.nan_to_num(wav, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1497,8 +1498,10 @@ def train_one_epoch(
                     if wav is None:
                         print(f"[ERROR] wav is None after semantic enhancement failure, using fallback")
                         try:
-                            fallback_out = decoder(z, dec_csi, return_wave=True, target_len=audio.size(-1))
-                            _, wav = _normalize_decoder_output(fallback_out)
+                            # 🔧 使用no_grad避免DDP参数重复标记
+                            with torch.no_grad():
+                                fallback_out = decoder(z, dec_csi, return_wave=True, target_len=audio.size(-1))
+                                _, wav = _normalize_decoder_output(fallback_out)
                         except Exception as fallback_error:
                             print(f"[ERROR] Fallback wave synthesis also failed: {fallback_error}")
                             # 生成零波形作为最后的fallback
@@ -1672,11 +1675,16 @@ def train_one_epoch(
             except Exception:
                 stats_iv = 20
             if stats_iv > 0 and (step % stats_iv == 0):
-                # Prefer raw 36-d features (pre-fusion) for 36-d stats; fallback to current feats
-                try:
-                    dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
-                except Exception:
-                    dh_probe = None
+                # 🔧 使用已有的decoder_outputs避免重复调用（修复DDP问题）
+                if 'decoder_outputs' in locals() and isinstance(decoder_outputs, dict):
+                    dh_probe = decoder_outputs
+                else:
+                    # 只有在没有可用输出时才调用，并且使用no_grad避免干扰DDP
+                    try:
+                        with torch.no_grad():
+                            dh_probe = decoder(z, dec_csi, enable_semantic_output=True, return_wave=False)
+                    except Exception:
+                        dh_probe = None
 
                 try:
                     if isinstance(dh_probe, dict):
