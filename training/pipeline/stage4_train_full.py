@@ -1176,6 +1176,9 @@ def train_one_epoch(
 
             # 检查是否使用语义增强解码器
             use_semantic_decoder = hasattr(decoder, 'get_semantic_info')
+            # 🔧 DDP环境下需要检查module属性
+            if not use_semantic_decoder and hasattr(decoder, 'module'):
+                use_semantic_decoder = hasattr(decoder.module, 'get_semantic_info')
 
             if use_semantic_decoder:
                 # 语义增强模式：直接在后面的分支中处理，这里只做基础前向用于兼容性
