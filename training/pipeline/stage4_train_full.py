@@ -1384,6 +1384,10 @@ def train_one_epoch(
 
                         semantic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
 
+                        # 🔥 调试：检查语义损失计算的入口条件
+                        print(f"🔍 Semantic Entry Debug - teacher_mode: '{teacher_mode}', ssl_teacher is None: {ssl_teacher is None}")
+                        print(f"🔍 Semantic Entry Debug - sem_ext is None: {sem_ext is None}")
+
                         if teacher_mode == 'ssl' and ssl_teacher is not None:
                             # 使用SSL Teacher：调用解码器的语义损失聚合（包含投影/InfoNCE/波形级/蒸馏）
                             try:
@@ -1463,6 +1467,7 @@ def train_one_epoch(
 
                         else:
                             # Stage3风格Teacher：使用16维语义提取器
+                            print(f"🔍 Semantic Stage3 Debug - Using sem_ext path, sem_ext is None: {sem_ext is None}")
                             if sem_ext is not None:
                                 with torch.no_grad():
                                     sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))  # [B,T,16]
@@ -1488,6 +1493,7 @@ def train_one_epoch(
                                     base = F.mse_loss(semantic_features.float(), sem_tgt.float())
 
                                 semantic_loss = base * sem_scale
+                                print(f"🔍 Semantic Stage3 Debug - base loss: {base.item():.6f}, sem_scale: {sem_scale:.4f}, final: {semantic_loss.item():.6f}")
 
                                 # 波形级语义约束（基于16维提取器）
                                 try:
@@ -1836,6 +1842,9 @@ def train_one_epoch(
                     hash_rate_loss = hash_reg_losses.get('rate_kl', hash_rate_loss)
                 except Exception:
                     hash_reg_losses = {}
+
+            # 🔥 最终损失组合前调试
+            print(f"🔍 Final Loss Debug - semantic_w: {semantic_w:.6f}, semantic_loss: {semantic_loss.item():.6f}, contribution: {semantic_w * semantic_loss.item():.6f}")
 
             loss = (
                 wave_w * wave_loss           # 波形质量损失
