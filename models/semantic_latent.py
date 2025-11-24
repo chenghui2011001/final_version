@@ -235,56 +235,22 @@ class LatentSpaceHead(nn.Module):
 
         if "infoce" in self.loss_type or "infonce" in self.loss_type:
             # flatten 到 [N, D]
-            try:
-                B, T, D = semantic_features_masked.shape
-                print(f"🔍 InfoNCE Debug - Input shapes: semantic_masked {semantic_features_masked.shape}, teacher_masked {teacher_sem_masked.shape}")
-
-                q = semantic_features_masked.reshape(-1, D)   # [N,D]
-                k = teacher_sem_masked.reshape(-1, D)         # [N,D]
-                print(f"🔍 InfoNCE Debug - After reshape: q {q.shape}, k {k.shape}")
-
-                if mask is not None:
-                    # 只保留 mask==1 的位置
-                    flat_mask = mask.view(-1)
-                    print(f"🔍 InfoNCE Debug - Mask shape: {flat_mask.shape}, valid count: {(flat_mask > 0.5).sum()}")
-                    q = q[flat_mask > 0.5]
-                    k = k[flat_mask > 0.5]
-                    print(f"🔍 InfoNCE Debug - After masking: q {q.shape}, k {k.shape}")
-
-                # 检查矩阵形状兼容性
-                if q.size(0) != k.size(0):
-                    print(f"❌ InfoNCE Error - Shape mismatch: q {q.shape} vs k {k.shape}")
-                    raise ValueError(f"InfoNCE shape mismatch: q {q.shape} vs k {k.shape}")
-
-                if q.size(0) == 0:
-                    print("⚠️ InfoNCE Warning - Empty tensors after masking, skipping InfoNCE")
-                    loss_nce = torch.tensor(0.0, device=q.device, requires_grad=True)
-                else:
-                    # 正样本对齐，负样本为其他位置
-                    q = F.normalize(q, dim=-1)
-                    k = F.normalize(k, dim=-1)
-                    print(f"🔍 InfoNCE Debug - After normalization: q {q.shape}, k {k.shape}")
-
-                    logits = (q @ k.t()) / self.temperature     # [N,N]
-                    print(f"🔍 InfoNCE Debug - Logits shape: {logits.shape}")
-
-                    labels = torch.arange(logits.size(0), device=logits.device)
-                    print(f"🔍 InfoNCE Debug - Labels shape: {labels.shape}")
-
-                    loss_nce = F.cross_entropy(logits, labels)
-                    print(f"✅ InfoNCE Success - Loss: {loss_nce.item():.6f}")
-
-                loss = loss + loss_nce
-                metrics["sem_nce"] = loss_nce.item()
-
-            except Exception as e:
-                print(f"❌ InfoNCE Exception: {e}")
-                import traceback
-                print(f"🔍 InfoNCE Stack Trace: {traceback.format_exc()}")
-                # 回退到简单损失
-                loss_nce = torch.tensor(0.0, device=semantic_features.device, requires_grad=True)
-                loss = loss + loss_nce
-                metrics["sem_nce"] = 0.0
+            B, T, D = semantic_features_masked.shape
+            q = semantic_features_masked.reshape(-1, D)   # [N,D]
+            k = teacher_sem_masked.reshape(-1, D)         # [N,D]
+            if mask is not None:
+                # 只保留 mask==1 的位置
+                flat_mask = mask.view(-1)
+                q = q[flat_mask > 0.5]
+                k = k[flat_mask > 0.5]
+            # 正样本对齐，负样本为其他位置
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+            logits = (q @ k.t()) / self.temperature     # [N,N]
+            labels = torch.arange(logits.size(0), device=logits.device)
+            loss_nce = F.cross_entropy(logits, labels)
+            loss = loss + loss_nce
+            metrics["sem_nce"] = loss_nce.item()
 
         metrics["sem_loss"] = float(loss.item())
         return semantic_features, loss, metrics

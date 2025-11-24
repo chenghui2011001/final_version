@@ -1384,10 +1384,6 @@ def train_one_epoch(
 
                         semantic_loss = torch.tensor(0.0, device=device, dtype=feats.dtype)
 
-                        # 🔥 调试：检查语义损失计算的入口条件
-                        print(f"🔍 Semantic Entry Debug - teacher_mode: '{teacher_mode}', ssl_teacher is None: {ssl_teacher is None}")
-                        print(f"🔍 Semantic Entry Debug - sem_ext is None: {sem_ext is None}")
-
                         if teacher_mode == 'ssl' and ssl_teacher is not None:
                             # 使用SSL Teacher：调用解码器的语义损失聚合（包含投影/InfoNCE/波形级/蒸馏）
                             try:
@@ -1432,42 +1428,16 @@ def train_one_epoch(
                                 train_one_epoch._sem_metrics = sem_metrics
                             except Exception as _se:
                                 print(f"⚠️ decoder-side semantic loss failed: {_se}")
-                                # 🔥 详细调试信息：捕获多GPU下语义损失计算异常
-                                import traceback
-                                print(f"🔍 Multi-GPU Debug - Exception Type: {type(_se).__name__}")
-                                print(f"🔍 Multi-GPU Debug - Exception Details: {str(_se)}")
-                                print(f"🔍 Multi-GPU Debug - Stack Trace: {traceback.format_exc()}")
-
-                                # 检查关键变量状态
-                                print(f"🔍 Multi-GPU Debug - semantic_features shape: {semantic_features.shape if semantic_features is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - ssl_feats shape: {ssl_feats.shape if ssl_feats is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - audio shape: {audio.shape if audio is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - z_sem shape: {decoder_outputs.get('z_sem', None).shape if decoder_outputs.get('z_sem', None) is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - decoder device: {next(decoder.parameters()).device}")
-                                print(f"🔍 Multi-GPU Debug - semantic_features device: {semantic_features.device if semantic_features is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - ssl_feats device: {ssl_feats.device if ssl_feats is not None else None}")
-                                print(f"🔍 Multi-GPU Debug - audio device: {audio.device if audio is not None else None}")
-
                                 # 回退到简单的cosine对齐（使用语义提取器）
-                                print("🔧 Multi-GPU Debug - Falling back to simple cosine alignment")
                                 if sem_ext is not None:
-                                    try:
-                                        with torch.no_grad():
-                                            sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))
-                                        sp = F.normalize(semantic_features.float(), dim=-1)
-                                        st = F.normalize(sem_tgt.float(), dim=-1)
-                                        semantic_loss = (1.0 - (sp * st).sum(dim=-1).mean()) * sem_scale
-                                        print(f"✅ Multi-GPU Debug - Fallback semantic_loss: {semantic_loss.item():.6f}")
-                                    except Exception as fallback_e:
-                                        print(f"❌ Multi-GPU Debug - Fallback also failed: {fallback_e}")
-                                        semantic_loss = torch.tensor(0.0, device=device)
-                                else:
-                                    print("❌ Multi-GPU Debug - sem_ext is None, cannot compute fallback")
-                                    semantic_loss = torch.tensor(0.0, device=device)
+                                    with torch.no_grad():
+                                        sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))
+                                    sp = F.normalize(semantic_features.float(), dim=-1)
+                                    st = F.normalize(sem_tgt.float(), dim=-1)
+                                    semantic_loss = (1.0 - (sp * st).sum(dim=-1).mean()) * sem_scale
 
                         else:
                             # Stage3风格Teacher：使用16维语义提取器
-                            print(f"🔍 Semantic Stage3 Debug - Using sem_ext path, sem_ext is None: {sem_ext is None}")
                             if sem_ext is not None:
                                 with torch.no_grad():
                                     sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))  # [B,T,16]
@@ -1493,7 +1463,6 @@ def train_one_epoch(
                                     base = F.mse_loss(semantic_features.float(), sem_tgt.float())
 
                                 semantic_loss = base * sem_scale
-                                print(f"🔍 Semantic Stage3 Debug - base loss: {base.item():.6f}, sem_scale: {sem_scale:.4f}, final: {semantic_loss.item():.6f}")
 
                                 # 波形级语义约束（基于16维提取器）
                                 try:
@@ -1842,9 +1811,6 @@ def train_one_epoch(
                     hash_rate_loss = hash_reg_losses.get('rate_kl', hash_rate_loss)
                 except Exception:
                     hash_reg_losses = {}
-
-            # 🔥 最终损失组合前调试
-            print(f"🔍 Final Loss Debug - semantic_w: {semantic_w:.6f}, semantic_loss: {semantic_loss.item():.6f}, contribution: {semantic_w * semantic_loss.item():.6f}")
 
             loss = (
                 wave_w * wave_loss           # 波形质量损失
@@ -3417,8 +3383,8 @@ def main() -> int:
                     output_device=local_rank,
                     find_unused_parameters=True
                 )
-                # 更新train_one_epoch中的引用
-                setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
+            # 🔧 无论是否DDP包装，都要更新train_one_epoch中的SSL teacher引用
+            setattr(train_one_epoch, '_ssl_teacher', ssl_teacher)
             # 如果没有可训练参数，SSL Teacher在所有GPU上保持同步，无需DDP包装
             # 🔧 确保所有进程能正确使用SSL Teacher（即使没有DDP包装）
             if distributed_training:
