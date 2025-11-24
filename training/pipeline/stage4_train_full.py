@@ -1413,7 +1413,9 @@ def train_one_epoch(
                                 # 🔥 获取潜空间特征z_sem用于语义损失计算
                                 z_sem = decoder_outputs.get('z_sem', None)
 
-                                sem_dec_loss, sem_metrics = decoder.compute_semantic_loss(
+                                # 🔧 DDP环境下需要通过.module访问方法
+                                decoder_model = decoder.module if hasattr(decoder, 'module') else decoder
+                                sem_dec_loss, sem_metrics = decoder_model.compute_semantic_loss(
                                     semantic_features,
                                     ssl_feats,
                                     loss_type=sem_loss_type,
