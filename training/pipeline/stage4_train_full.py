@@ -2334,9 +2334,16 @@ def train_one_epoch(
             if wandb_enabled and is_main_process() and (_wandb is not None):
                 log = {
                     'loss/total': float(loss.item()),
+                    # 通用核心损失
                     'loss/wave': float(wave_loss.item()),
+                    'loss/wave_total': float(wave_loss.item()),
                     'loss/acoustic': float(acoustic_loss.item()),
+                    'loss/acoustic_total': float(acoustic_loss.item()),
                     'loss/semantic': float(semantic_loss.item()),
+                    'loss/semantic_total': float(semantic_loss.item()),
+                    # Day1: GAN 相关
+                    'loss/adv': float(adv_loss.item()) if torch.is_tensor(adv_loss) else float(adv_loss),
+                    'loss/fmap': float(fm_loss.item()) if torch.is_tensor(fm_loss) else float(fm_loss),
                     'weight/wave': float(wave_w),
                     'weight/acoustic': float(acoustic_w),
                     'weight/semantic': float(semantic_w),
@@ -2359,6 +2366,8 @@ def train_one_epoch(
                     'film/dec_b_mean': float(dec_film_info.get('b_mean', 0.0) if dec_film_info else 0.0),
                     'audio/rms_db_pred': float(rms_db_pred.mean().item()),
                     'audio/amp_db_delta': float((rms_db_pred - rms_db_tgt).mean().item()),
+                    # Day1: 方便检索的别名
+                    'audio/pred_rms_db': float(rms_db_pred.mean().item()),
                 }
                 # Channel proxies if present
                 try:
@@ -2380,6 +2389,11 @@ def train_one_epoch(
                         else:
                             vv = float(v)
                         log[f'wave/{k}'] = vv
+                        # Day1: 显式记录关键子项
+                        if k == 'train_mr_stft':
+                            log['loss/wave_mrstft'] = vv
+                        elif k == 'train_l1':
+                            log['loss/wave_l1'] = vv
                 except Exception:
                     pass
                 try:
