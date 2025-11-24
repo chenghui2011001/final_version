@@ -328,6 +328,10 @@ class AETHEREncoder(nn.Module):
 
         # CSI: use unified 10-dim layout (snr_norm + fading_onehot(8) + ber)
         csi_vec = build_csi_vec(csi_dict, target_dim=self.d_csi)
+        # C. NaN防御：对解码端FiLM的CSI进行显式清洗
+        csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=0.0, neginf=0.0)
+        # C. NaN防御：对FiLM前的CSI进行显式清洗（NaN/Inf→0）
+        csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=0.0, neginf=0.0)
         if csi_vec.size(0) != b:
             csi_vec = csi_vec.expand(b, -1)
 
@@ -344,6 +348,15 @@ class AETHEREncoder(nn.Module):
         if self.active_use_film and self.film is not None:
             T, D = h.shape[1], h.shape[2]
             alpha, beta = self.film(csi_vec, T=T)
+            # 记录非有限计数，并清洗 a/b 数值，便于后续可观测
+            try:
+                nan_count_a = int((~torch.isfinite(alpha)).sum().detach().cpu().item())
+                nan_count_b = int((~torch.isfinite(beta)).sum().detach().cpu().item())
+            except Exception:
+                nan_count_a = 0
+                nan_count_b = 0
+            alpha = torch.nan_to_num(alpha, nan=1.0, posinf=1.0, neginf=1.0)
+            beta  = torch.nan_to_num(beta,  nan=0.0, posinf=0.0, neginf=0.0)
             k = int(round(self.film_ratio * D))
             if k > 0:
                 perm = self.film_perm
@@ -354,7 +367,31 @@ class AETHEREncoder(nn.Module):
                 mask = torch.zeros_like(h)
             alpha_eff = 1.0 + (alpha - 1.0) * mask * self.film_ratio
             beta_eff = beta * mask * (self.film_ratio * self.film_beta_scale)
+            # Respect optional clamp ranges from FiLM (scale clamp applies to gamma-1)
+            try:
+                s_lo = getattr(self.film, '_clamp_scale_lo', None)
+                s_hi = getattr(self.film, '_clamp_scale_hi', None)
+                sh_lo = getattr(self.film, '_clamp_shift_lo', None)
+                sh_hi = getattr(self.film, '_clamp_shift_hi', None)
+                if isinstance(s_lo, float) and isinstance(s_hi, float):
+                    alpha_eff = alpha_eff.clamp_(1.0 + s_lo, 1.0 + s_hi)
+                if isinstance(sh_lo, float) and isinstance(sh_hi, float):
+                    beta_eff = beta_eff.clamp_(sh_lo, sh_hi)
+            except Exception:
+                pass
             h = alpha_eff * h + beta_eff
+            # 轻量FiLM诊断（可观测统计）
+            try:
+                self._last_film_stats = {
+                    'a_mean': float(alpha.detach().mean().item()),
+                    'b_mean': float(beta.detach().mean().item()),
+                    'scale_mean': float(alpha_eff.detach().mean().item()),
+                    'shift_mean': float(beta_eff.detach().mean().item()),
+                    'nan_count_a': int(nan_count_a),
+                    'nan_count_b': int(nan_count_b),
+                }
+            except Exception:
+                self._last_film_stats = {'nan_count_a': int(nan_count_a), 'nan_count_b': int(nan_count_b)}
 
         h, stream_logs = self.backbone(h, attn_mask)
         logs.update(stream_logs)

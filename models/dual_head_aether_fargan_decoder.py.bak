@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+双头AETHER-FARGAN解码器：共享latent + SSL语义蒸馏
+
+核心设计：
+1. FARGAN接口保持20维（声学头）
+2. 语义头输出16维与SSL teacher对齐
+3. 共享latent通过多任务loss约束，在1.2kbps下优先保留语义信息
+4. 完全替代FiLM那套奇技淫巧，使用标准的dual-head架构
+"""
+
+from __future__ import annotations
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Tuple, Optional, Any
+import math
+
+try:
+    # 尝试包内相对导入
+    from ..aether_encoder_decoder import AETHERDecoder
+    from ..fargan_components import FARGANCore
+    from .semantic_head import SemanticHead, AcousticHead
+except Exception:
+    # 回退到绝对导入
+    from models.aether_encoder_decoder import AETHERDecoder
+    from models.fargan_components import FARGANCore
+    from models.semantic_head import SemanticHead, AcousticHead
+
+try:
+    from utils.feature_spec import get_default_feature_spec
+except Exception:
+    from dnn.torch.final_version.utils.feature_spec import get_default_feature_spec
+
+
+class DualHeadAETHERFARGANDecoder(AETHERDecoder):
+    """
+    双头AETHER-FARGAN解码器
+
+    架构：
+    AETHER Encoder → 共享隐状态 h[t] → 双头输出：
+                                        ├─ 声学头 → 20维 → FARGAN → wave
+                                        └─ 语义头 → 16维 → SSL对齐
+
+    训练策略：
+    - 声学头：保证FARGAN能正常工作，L_feat_20 + L_wave
+    - 语义头：与SSL teacher对齐，L_semantic
+    - 共享表示：通过梯度反传，被双重约束塑造隐空间
+    """
+
+    def __init__(
+        self,
+        dz: int = 24,
+        d_hidden: int = 128,
+        d_csi: int = 32,
+        decoder_heads: int = 2,
+        # 双头配置
+        acoustic_dim: int = 20,          # 声学特征维度
+        semantic_dim: int = 16,          # 语义特征维度
+        ssl_dim: int = 768,              # SSL模型维度(HuBERT-base)
+        # FARGAN配置
+        enable_fargan_synth: bool = True,
+        fargan_subframe_size: int = 40,
+        fargan_nb_subframes: int = 4,
+        frame_rate_hz: float = 100.0,
+        # 兼容性配置
+        feature_spec_type: str = "fargan",
+        use_film: bool = False,
+        # 语义头配置
+        semantic_projection_layers: int = 2,
+        semantic_dropout: float = 0.1,
+    ):
+        # 初始化父类：输出维度设为隐状态维度，不直接输出特征
+        super().__init__(
+            dz=dz,
+            d_out=d_hidden,  # 输出隐状态，而不是特征
+            d_hidden=d_hidden,
+            d_csi=d_csi,
+            decoder_heads=decoder_heads,
+            enable_synth=False,  # 禁用原有合成器
+            feature_spec_type=feature_spec_type,
+            use_film=use_film,
+        )
+
+        # 维度配置
+        self.acoustic_dim = acoustic_dim
+        self.semantic_dim = semantic_dim
+        self.ssl_dim = ssl_dim
+
+        # FARGAN配置
+        self.enable_fargan_synth = enable_fargan_synth
+        self.frame_rate_hz = frame_rate_hz
+        self.fargan_frame_size = fargan_subframe_size * fargan_nb_subframes  # 160
+
+        # 双头：从共享隐状态分别提取声学和语义特征
+        self.acoustic_head = AcousticHead(
+            hidden_dim=d_hidden,
+            acoustic_dim=acoustic_dim,
+            use_layer_norm=False,  # 声学特征通常不需要归一化
+        )
+
+        self.semantic_head = SemanticHead(
+            hidden_dim=d_hidden,
+            semantic_dim=semantic_dim,
+            ssl_dim=ssl_dim,
+            projection_layers=semantic_projection_layers,
+            dropout=semantic_dropout,
+        )
+
+        # FARGAN声码器（只接受20维声学特征）
+        if self.enable_fargan_synth:
+            self.fargan_core = FARGANCore(
+                subframe_size=fargan_subframe_size,
+                nb_subframes=fargan_nb_subframes,
+                feature_dim=acoustic_dim,  # 注意：只使用20维
+                cond_size=256,  # 匹配标准FARGAN配置
+            )
+
+            # 周期估计器（从20维声学特征估计）
+            self.period_estimator = nn.Sequential(
+                nn.Linear(acoustic_dim, 32),
+                nn.GELU(),
+                nn.Linear(32, 1)
+            )
+
+        # 兼容性：为了与旧代码兼容，保留36维输出接口
+        self.legacy_combiner = nn.Linear(
+            acoustic_dim + semantic_dim,
+            36,
+            bias=False
+        )
+        # 初始化为恒等映射的前36维
+        with torch.no_grad():
+            self.legacy_combiner.weight.zero_()
+            self.legacy_combiner.weight[:acoustic_dim, :acoustic_dim] = torch.eye(acoustic_dim)
+            self.legacy_combiner.weight[acoustic_dim:, acoustic_dim:] = torch.eye(semantic_dim)
+
+    def forward(
+        self,
+        z: torch.Tensor,                    # [B, T, dz]
+        csi_dict_or_csi = None,             # CSI字典或Tensor (兼容旧接口)
+        return_wave: bool = False,
+        target_len: Optional[int] = None,
+        return_separate_heads: bool = False,  # 是否返回分离的双头输出
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+
+        Args:
+            z: 编码器输出 [B, T, dz]
+            csi_dict_or_csi: 信道状态信息字典或Tensor (兼容旧接口)
+            return_wave: 是否合成波形
+            target_len: 目标波形长度
+            return_separate_heads: 是否返回分离的双头输出
+
+        Returns:
+            outputs: {
+                'features': [B, T, 36],           # 兼容性输出
+                'acoustic_features': [B, T, 20],  # 声学特征
+                'semantic_features': [B, T, 16],  # 语义特征
+                'hidden_states': [B, T, d_hidden], # 共享隐状态
+                'wave': [B, T_wave] (可选),       # 合成波形
+            }
+        """
+        # 兼容性处理：将旧接口的csi转换为csi_dict
+        if csi_dict_or_csi is None:
+            csi_dict = None
+        elif hasattr(csi_dict_or_csi, 'keys'):  # 检查是否为字典类型
+            csi_dict = csi_dict_or_csi
+        elif isinstance(csi_dict_or_csi, torch.Tensor):
+            # 如果传入的是Tensor，包装为dict格式
+            csi_dict = {'csi_tensor': csi_dict_or_csi}
+        else:
+            # 其他情况，直接传递
+            csi_dict = csi_dict_or_csi
+
+        # Step 1: 通过父类AETHER解码器得到共享隐状态
+        # 这里d_out=d_hidden，所以decoder_output实际是隐状态
+        decoder_output = super().forward(z, csi_dict=csi_dict, return_wave=False, **kwargs)
+
+        if isinstance(decoder_output, dict):
+            hidden_states = decoder_output['features']  # [B, T, d_hidden]
+        else:
+            hidden_states = decoder_output  # [B, T, d_hidden]
+
+        # Step 2: 双头提取特征
+        acoustic_features = self.acoustic_head(hidden_states)   # [B, T, 20]
+        semantic_features = self.semantic_head(hidden_states)   # [B, T, 16]
+
+        # Step 3: 构建输出字典
+        outputs = {
+            'acoustic_features': acoustic_features,
+            'semantic_features': semantic_features,
+            'hidden_states': hidden_states,
+        }
+
+        # 兼容性输出：组合成36维特征
+        combined_features = torch.cat([acoustic_features, semantic_features], dim=-1)
+        legacy_36_features = self.legacy_combiner(combined_features)
+        outputs['features'] = legacy_36_features
+
+        # Step 4: 可选的FARGAN波形合成
+        if return_wave and self.enable_fargan_synth:
+            wave = self._synthesize_wave(acoustic_features, target_len)
+            outputs['wave'] = wave
+
+        return outputs
+
+    def _synthesize_wave(
+        self,
+        acoustic_features: torch.Tensor,  # [B, T, 20]
+        target_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        """使用FARGAN从20维声学特征合成波形"""
+        B, T, _ = acoustic_features.shape
+
+        # 估计周期
+        period_raw = self.period_estimator(acoustic_features)  # [B, T, 1]
+        period = torch.round(period_raw).clamp(32, 255).to(torch.long).squeeze(-1)  # [B, T]
+
+        # FARGAN合成
+        wave = self.fargan_core(acoustic_features, period)  # [B, T_wave]
+
+        # 长度调整
+        if target_len is not None:
+            current_len = wave.size(-1)
+            if current_len > target_len:
+                wave = wave[..., :target_len]
+            elif current_len < target_len:
+                # 零填充
+                pad_len = target_len - current_len
+                wave = F.pad(wave, (0, pad_len), mode='constant', value=0.0)
+
+        return wave
+
+    def compute_semantic_loss(
+        self,
+        semantic_features: torch.Tensor,  # [B, T, 16]
+        ssl_features: torch.Tensor,      # [B, T, ssl_dim]
+        loss_type: str = "cosine"
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """计算语义对齐损失"""
+        return self.semantic_head.compute_semantic_loss(
+            semantic_features, ssl_features, loss_type
+        )
+
+    def get_dual_head_info(self) -> Dict[str, Any]:
+        """获取双头解码器配置信息"""
+        return {
+            'acoustic_dim': self.acoustic_dim,
+            'semantic_dim': self.semantic_dim,
+            'ssl_dim': self.ssl_dim,
+            'total_legacy_dim': self.acoustic_dim + self.semantic_dim,
+            'enable_fargan_synth': self.enable_fargan_synth,
+            'frame_rate_hz': self.frame_rate_hz,
+        }
+
+    def set_semantic_training_mode(self, enabled: bool = True):
+        """控制语义头的训练模式"""
+        self.semantic_head.train(enabled)
+        if hasattr(self, 'acoustic_head'):
+            # 声学头始终训练，确保FARGAN兼容性
+            self.acoustic_head.train(True)
+
+    def freeze_semantic_head(self):
+        """冻结语义头，只训练声学分支"""
+        for param in self.semantic_head.parameters():
+            param.requires_grad = False
+        print("语义头已冻结，只训练声学分支")
+
+    def unfreeze_semantic_head(self):
+        """解冻语义头，恢复双头训练"""
+        for param in self.semantic_head.parameters():
+            param.requires_grad = True
+        print("语义头已解冻，恢复双头训练")
+
+
+def create_dual_head_decoder(
+    config: Dict[str, Any],
+    enable_fargan: bool = True,
+    ssl_model_type: str = "hubert-base",
+) -> DualHeadAETHERFARGANDecoder:
+    """
+    创建双头解码器的便捷函数
+
+    Args:
+        config: 配置字典
+        enable_fargan: 是否启用FARGAN合成
+        ssl_model_type: SSL模型类型
+
+    Returns:
+        DualHeadAETHERFARGANDecoder实例
+    """
+    # SSL维度映射
+    ssl_dim_map = {
+        "hubert-base": 768,
+        "hubert-large": 1024,
+        "wavlm-base": 768,
+        "wavlm-large": 1024,
+    }
+
+    ssl_dim = ssl_dim_map.get(ssl_model_type, 768)
+
+    return DualHeadAETHERFARGANDecoder(
+        dz=config.get("dz", 24),
+        d_hidden=config.get("d_hidden", 128),
+        d_csi=config.get("d_csi", 32),
+        decoder_heads=config.get("decoder_heads", 2),
+        acoustic_dim=20,
+        semantic_dim=16,
+        ssl_dim=ssl_dim,
+        enable_fargan_synth=enable_fargan,
+        fargan_subframe_size=config.get("fargan_subframe_size", 40),
+        fargan_nb_subframes=config.get("fargan_nb_subframes", 4),
+        frame_rate_hz=config.get("frame_rate_hz", 100.0),
+    )
+
+
+if __name__ == "__main__":
+    # 测试双头AETHER-FARGAN解码器
+    print("Testing DualHeadAETHERFARGANDecoder...")
+
+    # 创建测试数据
+    batch_size, seq_len = 2, 50
+    dz, d_csi = 24, 32
+
+    z = torch.randn(batch_size, seq_len, dz)
+    csi = torch.randn(batch_size, seq_len, d_csi)
+    ssl_features = torch.randn(batch_size, seq_len, 768)  # HuBERT特征
+
+    # 创建双头解码器
+    config = {
+        "dz": dz,
+        "d_hidden": 128,
+        "d_csi": d_csi,
+        "decoder_heads": 2,
+    }
+
+    decoder = create_dual_head_decoder(config, enable_fargan=True)
+
+    # 前向传播
+    csi_dict = {'default': csi}  # 转换为字典格式
+    outputs = decoder(z, csi_dict=csi_dict, return_wave=True)
+
+    print(f"Input z shape: {z.shape}")
+    print(f"Input csi shape: {csi.shape}")
+    print(f"Legacy features shape: {outputs['features'].shape}")
+    print(f"Acoustic features shape: {outputs['acoustic_features'].shape}")
+    print(f"Semantic features shape: {outputs['semantic_features'].shape}")
+    print(f"Hidden states shape: {outputs['hidden_states'].shape}")
+    print(f"Wave shape: {outputs['wave'].shape}")
+
+    # 测试语义损失
+    semantic_loss, metrics = decoder.compute_semantic_loss(
+        outputs['semantic_features'],
+        ssl_features,
+        loss_type="cosine"
+    )
+
+    print(f"\nSemantic loss: {semantic_loss.item():.6f}")
+    print(f"Metrics: {metrics}")
+
+    # 测试双头信息
+    info = decoder.get_dual_head_info()
+    print(f"\nDual head info: {info}")
+
+    print("\nDualHeadAETHERFARGANDecoder test completed!")

@@ -66,6 +66,8 @@ class AETHEREncoder(nn.Module):
         pathway_warmup_steps: int = 2000,    # 增加warmup步数
         # 输入分流：将前20维映射给Ribbon（coarse），后16维映射给Thread（fine）
         split_stream_inputs: bool = False,
+        # FiLM对信道劣化的额外敏感度（0~1，越大表示坏信道下FiLM越强）
+        film_channel_gain: float = 0.5,
     ) -> None:
         super().__init__()
         self.d_csi = d_csi
@@ -78,6 +80,7 @@ class AETHEREncoder(nn.Module):
         self.use_semantic_head = use_semantic_head
         self.semantic_dim = semantic_dim
         self.semantic_source = semantic_source
+        self.film_channel_gain = float(max(0.0, min(1.0, film_channel_gain)))
 
         self.in_proj = nn.Linear(d_in, d_model)
         self.split_stream_inputs = bool(split_stream_inputs)
@@ -129,7 +132,8 @@ class AETHEREncoder(nn.Module):
         # ---- Numerical stability guards (especially under AMP) ----
         in_dtype = x.dtype
         # Early steps are most unstable under fp16/bf16; run encoder core in fp32 briefly
-        use_safe_fp32 = (in_dtype in (torch.float16, torch.bfloat16)) and (int(training_step) < 200)
+        # Early steps容易在混合精度下不稳定：扩大安全窗口到前1000步，统一在fp32中执行编码器主干
+        use_safe_fp32 = (in_dtype in (torch.float16, torch.bfloat16)) and (int(training_step) < 1000)
         # Sanitize inputs to avoid propagating NaN/Inf from data
         x_safe = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-10.0, 10.0)
         if use_safe_fp32:
@@ -144,12 +148,26 @@ class AETHEREncoder(nn.Module):
         if self.use_film and self.film is not None and csi_dict is not None:
             csi_vec = build_csi_vec(csi_dict, target_dim=self.d_csi)  # [B, d_csi]
             # Ensure CSI is finite and on matching dtype for FiLM computation
-            csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=1.0, neginf=-1.0)
+            # C. NaN防御：pos/neg inf -> 0 以便可观测
+            csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=0.0, neginf=0.0)
             if use_safe_fp32:
                 csi_vec = csi_vec.float()
             a, b = self.film(csi_vec, T=t)  # [B,T,D]
-            a = torch.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
-            b = torch.nan_to_num(b, nan=0.0, posinf=1.0, neginf=-1.0)
+            # 记录非有限比率/计数，便于诊断FiLM门控是否被钳制
+            try:
+                a_finite = torch.isfinite(a).float().mean().item()
+                b_finite = torch.isfinite(b).float().mean().item()
+                film_nan_ratio_a = float(max(0.0, 1.0 - a_finite))
+                film_nan_ratio_b = float(max(0.0, 1.0 - b_finite))
+                nan_count_a = int((~torch.isfinite(a)).sum().detach().cpu().item())
+                nan_count_b = int((~torch.isfinite(b)).sum().detach().cpu().item())
+            except Exception:
+                film_nan_ratio_a = 0.0
+                film_nan_ratio_b = 0.0
+                nan_count_a = 0
+                nan_count_b = 0
+            a = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            b = torch.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
             # Temporal smoothing (causal moving average) if enabled
             if hasattr(self, 'film_smooth_kernel') and self.film_smooth_kernel.numel() > 1:
                 def _smooth(x: torch.Tensor) -> torch.Tensor:
@@ -168,11 +186,67 @@ class AETHEREncoder(nn.Module):
                 return start + (end - start) * r
             pre_s = _ramp(training_step, getattr(self, 'film_pre_start', 0.0), getattr(self, 'film_pre_end', 0.2), getattr(self, 'film_pre_warmup', 1000))
             post_s = _ramp(training_step, getattr(self, 'film_post_start', 0.2), getattr(self, 'film_post_end', 0.6), getattr(self, 'film_post_warmup', 0))
+
+            # --- Day3: 让FiLM对CSI更加敏感（坏信道→更强FiLM） ---
+            # 仅在提供CSI字典时，根据 snr_proxy/time_selectivity/freq_selectivity/los_ratio
+            # 构造一个简单的“badness”指标，对 pre_s/post_s 施加温和放大。
+            try:
+                snr_proxy = None
+                if csi_dict is not None:
+                    if 'snr_proxy' in csi_dict and torch.is_tensor(csi_dict['snr_proxy']):
+                        snr_proxy = csi_dict['snr_proxy'].detach()
+                    elif 'snr_db' in csi_dict and torch.is_tensor(csi_dict['snr_db']):
+                        snr_proxy = csi_dict['snr_db'].detach()
+                ts = csi_dict.get('time_selectivity', None) if csi_dict is not None else None
+                fs = csi_dict.get('freq_selectivity', None) if csi_dict is not None else None
+                los = csi_dict.get('los_ratio', None) if csi_dict is not None else None
+
+                if snr_proxy is not None:
+                    snr_norm = ((snr_proxy.clamp(-5.0, 5.0) + 5.0) / 10.0).mean().item()
+                else:
+                    snr_norm = 0.5
+                ts_norm = ts.clamp(0.0, 1.0).mean().item() if torch.is_tensor(ts) else 0.5
+                fs_norm = fs.clamp(0.0, 1.0).mean().item() if torch.is_tensor(fs) else 0.5
+                los_norm = los.clamp(0.0, 1.0).mean().item() if torch.is_tensor(los) else 0.5
+
+                snr_bad = 1.0 - snr_norm
+                ts_bad = ts_norm
+                fs_bad = fs_norm
+                los_bad = 1.0 - los_norm
+                bad = max(0.0, min(1.0, 0.25 * (snr_bad + ts_bad + fs_bad + los_bad)))
+                # Day4: 略加强FiLM对坏信道的响应（与JSCC权重一致做 trade-off）
+                #       使得低SNR/高TS/FS/低LOS时 pre/post_s 有更明显提升。
+                gain = 1.0 + (self.film_channel_gain * 1.5) * bad
+                pre_s = float(pre_s * gain)
+                post_s = float(post_s * gain)
+            except Exception:
+                pass
             # Numeric constraints for stability
             scale = (0.4 + 1.2 * torch.sigmoid(a.float())).to(h.dtype)  # [0.4,1.6]
             shift = (0.3 * torch.tanh(b.float())).to(h.dtype)          # limited shift
-            scale = torch.nan_to_num(scale, nan=1.0, posinf=1.6, neginf=0.4).clamp_(0.25, 2.0)
-            shift = torch.nan_to_num(shift, nan=0.0, posinf=0.3, neginf=-0.3).clamp_(-0.4, 0.4)
+            scale = torch.nan_to_num(scale, nan=1.0, posinf=1.6, neginf=0.4)
+            shift = torch.nan_to_num(shift, nan=0.0, posinf=0.3, neginf=-0.3)
+            # If FiLM exposes custom clamp ranges, respect them; otherwise use safe defaults
+            s_lo = getattr(self.film, '_clamp_scale_lo', None)
+            s_hi = getattr(self.film, '_clamp_scale_hi', None)
+            sh_lo = getattr(self.film, '_clamp_shift_lo', None)
+            sh_hi = getattr(self.film, '_clamp_shift_hi', None)
+            if isinstance(s_lo, float) and isinstance(s_hi, float):
+                scale = scale.clamp_(1.0 + s_lo, 1.0 + s_hi)
+            else:
+                scale = scale.clamp_(0.25, 2.0)
+            if isinstance(sh_lo, float) and isinstance(sh_hi, float):
+                shift = shift.clamp_(sh_lo, sh_hi)
+            else:
+                shift = shift.clamp_(-0.4, 0.4)
+            # C. 统计FiLM门控被钳的次数（边界触达计数）
+            try:
+                clamp_scale_lo = int((scale <= 0.25).sum().detach().cpu().item())
+                clamp_scale_hi = int((scale >= 2.0).sum().detach().cpu().item())
+                clamp_shift_lo = int((shift <= -0.4).sum().detach().cpu().item())
+                clamp_shift_hi = int((shift >= 0.4).sum().detach().cpu().item())
+            except Exception:
+                clamp_scale_lo = clamp_scale_hi = clamp_shift_lo = clamp_shift_hi = 0
             if self.film_position in ('pre', 'both'):
                 # pre: gain only, small strength
                 h = (1.0 + pre_s * (scale - 1.0)) * h
@@ -189,6 +263,14 @@ class AETHEREncoder(nn.Module):
                     'b_mean': float(b.detach().mean().item()) if b is not None else 0.0,
                     'scale_mean': float(scale.detach().mean().item()),
                     'shift_mean': float(shift.detach().mean().item()),
+                    'nan_ratio_a': film_nan_ratio_a,
+                    'nan_ratio_b': film_nan_ratio_b,
+                    'nan_count_a': int(nan_count_a),
+                    'nan_count_b': int(nan_count_b),
+                    'clamp_scale_lo': int(clamp_scale_lo),
+                    'clamp_scale_hi': int(clamp_scale_hi),
+                    'clamp_shift_lo': int(clamp_shift_lo),
+                    'clamp_shift_hi': int(clamp_shift_hi),
                 }
             except Exception:
                 pass
@@ -372,6 +454,8 @@ class AETHERDecoder(nn.Module):
         # CSI-aware refinement
         if csi_dict is not None:
             csi_vec = build_csi_vec(csi_dict, target_dim=self.d_csi)  # [B,10]
+            # C. NaN防御（解码端FiLM前）：pos/neg inf -> 0
+            csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             # Create zero CSI vector when not provided
             csi_vec = torch.zeros(z.size(0), self.d_csi, device=z.device, dtype=z.dtype)

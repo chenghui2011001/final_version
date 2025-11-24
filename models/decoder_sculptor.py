@@ -33,6 +33,10 @@ class GatedConv1DBlock(nn.Module):
 class ConvRefineDecoder(nn.Module):
     """
     Local sculpting module for the decoder with CSI driven FiLM modulation.
+
+    该模块原本只是在卷积栈入口处做一次固定强度的FiLM，CLI 提供的
+    `--dec-film-*` 选项也不会真正影响forward。为了和编码端形成对称，
+    这里实现了可配置的“pre/post”双段FiLM、训练步控制以及诊断输出。
     """
 
     def __init__(
@@ -42,6 +46,8 @@ class ConvRefineDecoder(nn.Module):
         d_hidden: int = 128,
         csi_dim: int = 32,
         use_film: bool = True,  # 新增：可选禁用FiLM
+        # FiLM对信道劣化的额外敏感度（0~1，越大表示坏信道下FiLM越强）
+        film_channel_gain: float = 0.5,
     ) -> None:
         super().__init__()
         self.use_film = use_film
@@ -56,20 +62,63 @@ class ConvRefineDecoder(nn.Module):
         # Std floor to prevent variance collapse; tunable via attribute
         self.std_floor: float = 0.2
         self.film = KANLiteFiLM(d_csi=csi_dim, d_feat=d_hidden, time_dependent=True) if use_film else None
-        # FiLM scaling knobs (functional symmetry: decoder侧以增益为主，偏置为辅)
+        # FiLM scaling knobs，和编码端保持功能对称
         self.film_gain_scale: float = 1.0
-        self.film_bias_scale: float = 0.0  # 默认不使用偏置，保持“pre γ 为主”
-        # Optional inverse mode: encourage CSI removal (gamma -> 2-alpha, beta sign -> negative)
+        self.film_bias_scale: float = 0.0
         self.film_invert: bool = False
+        self.film_channel_gain: float = float(max(0.0, min(1.0, film_channel_gain)))
 
-        # 帧级先验（Acoustic Priors）→ 时变FiLM增强（最小入侵式）
-        # 从时间维提炼轻量先验，映射为 per-frame α/β，再与 KANLiteFiLM 输出融合
+        # 为了支持“pre/post” 双阶段调度，引入 ramp 配置
+        self.film_pre_start: float = 1.0
+        self.film_pre_end: float = 1.0
+        self.film_pre_warmup: int = 0
+        self.film_post_start: float = 0.0
+        self.film_post_end: float = 0.0
+        self.film_post_warmup: int = 0
+
+        # 帧级先验（Acoustic Priors）驱动的FiLM增强
         self.use_acoustic_priors: bool = True
         self.ap_channels: int = 16
-        self.ap_blend: float = 0.5  # 0..1，越大越依赖帧级先验
+        self.ap_blend: float = 0.5  # 0..1 越大越依赖先验
         self.ap_conv_t = nn.Conv1d(d_hidden, self.ap_channels, kernel_size=3, padding=1)
         self.ap_conv_out_alpha = nn.Conv1d(self.ap_channels, d_hidden, 1)
         self.ap_conv_out_beta = nn.Conv1d(self.ap_channels, d_hidden, 1)
+
+        # 训练步/诊断缓存
+        self._film_step: int | None = None
+        self._last_film_stats: dict[str, float] | None = None
+        # 可由上游训练脚本传入的batch级JSCC“坏度”指标（0~1）
+        self._jscc_bad: float | None = None
+
+    @staticmethod
+    def _ramp(step: int | None, start: float, end: float, warmup: int) -> float:
+        if step is None or warmup <= 0:
+            return end
+        ratio = max(0.0, min(1.0, float(step) / float(warmup)))
+        return start + (end - start) * ratio
+
+    def configure_film_schedule(
+        self,
+        pre_start: float = 1.0,
+        pre_end: float = 1.0,
+        pre_warmup: int = 0,
+        post_start: float = 0.0,
+        post_end: float = 0.0,
+        post_warmup: int = 0,
+    ) -> None:
+        """Configure decoder FiLM gain/bias schedules (对称于编码端)."""
+        self.film_pre_start = float(pre_start)
+        self.film_pre_end = float(pre_end)
+        self.film_pre_warmup = int(max(0, pre_warmup))
+        self.film_post_start = float(post_start)
+        self.film_post_end = float(post_end)
+        self.film_post_warmup = int(max(0, post_warmup))
+
+    def set_training_step(self, step: int) -> None:
+        self._film_step = int(step)
+
+    def get_film_stats(self) -> dict[str, float] | None:
+        return self._last_film_stats
 
     def forward(self, z: torch.Tensor, csi_vec: torch.Tensor) -> torch.Tensor:
         """
@@ -94,14 +143,40 @@ class ConvRefineDecoder(nn.Module):
                 csi_vec = csi_vec.expand(b, -1)  # 广播到 B
             else:
                 csi_vec = csi_vec[:b]  # 截断到 B
+        # C. NaN防御：对解码端FiLM的CSI进行显式清洗
+        csi_vec = torch.nan_to_num(csi_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
         h = self.in_proj(z.transpose(1, 2))  # [B, d_hidden, T]
         h_in = h  # 保存pre-FiLM特征用于帧级先验提炼
+        pre_strength = self._ramp(self._film_step, self.film_pre_start, self.film_pre_end, self.film_pre_warmup)
+        post_strength = self._ramp(self._film_step, self.film_post_start, self.film_post_end, self.film_post_warmup)
+
+        # Day3: 让解码端FiLM对CSI“坏度”更敏感。
+        # 训练脚本会在启用随机CSI后，把 batch 级 badness 写入 _jscc_bad（0~1）。
+        # 这里按 encoder 同样的规则做温和放大：pre/post_strength *= 1 + film_channel_gain * bad。
+        if self._jscc_bad is not None:
+            try:
+                bad = float(self._jscc_bad)
+                bad = max(0.0, min(1.0, bad))
+                gain = 1.0 + self.film_channel_gain * bad
+                pre_strength *= gain
+                post_strength *= gain
+            except Exception:
+                pass
 
         # 可选的FiLM调制（仅在use_film=True时执行）
         if self.use_film and self.film is not None:
             # 生成 FiLM 参数（理想形状 [B, T, d_hidden]）
             alpha, beta = self.film(csi_vec, T=t)
+            # 统计非有限计数并进行清洗，确保后续数值稳定
+            try:
+                nan_count_alpha = int((~torch.isfinite(alpha)).sum().detach().cpu().item())
+                nan_count_beta  = int((~torch.isfinite(beta)).sum().detach().cpu().item())
+            except Exception:
+                nan_count_alpha = 0
+                nan_count_beta = 0
+            alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+            beta  = torch.nan_to_num(beta,  nan=0.0, posinf=0.0, neginf=0.0)
 
             # —— 新增：强制把 2D/维度不匹配的情况修正为 3D [B, T, d_hidden] —— #
             if alpha.dim() == 2:           # [B, d_hidden] -> [B, T, d_hidden]
@@ -124,18 +199,70 @@ class ConvRefineDecoder(nn.Module):
                 alpha_cf = (1.0 - w) * alpha_cf + w * ap_alpha
                 beta_cf  = (1.0 - w) * beta_cf  + w * ap_beta
 
-            # FiLM 调制（decoder侧：以增益为主，偏置缩放）
-            if self.film_invert:
-                gamma = (2.0 - alpha_cf)
-                bias = -abs(self.film_bias_scale) * beta_cf
-                h = (1.0 + self.film_gain_scale * (gamma - 1.0)) * h + bias
-            else:
-                h = (1.0 + self.film_gain_scale * (alpha_cf - 1.0)) * h + self.film_bias_scale * beta_cf
+            def _apply_film(x: torch.Tensor, strength: float, stage: str) -> torch.Tensor:
+                if strength <= 0.0:
+                    return x
+                scale = strength * self.film_gain_scale
+                bias_scale = strength * self.film_bias_scale
+                # Compute multiplicative gamma and additive bias
+                if self.film_invert:
+                    gamma = (2.0 - alpha_cf)
+                    bias = -abs(bias_scale) * beta_cf
+                else:
+                    gamma = alpha_cf
+                    bias = bias_scale * beta_cf
+                gamma = (1.0 + scale * (gamma - 1.0))
+                # Optional clamp from FiLM module if provided via set_clamp
+                try:
+                    s_lo = getattr(self.film, '_clamp_scale_lo', None)
+                    s_hi = getattr(self.film, '_clamp_scale_hi', None)
+                    sh_lo = getattr(self.film, '_clamp_shift_lo', None)
+                    sh_hi = getattr(self.film, '_clamp_shift_hi', None)
+                    if isinstance(s_lo, float) and isinstance(s_hi, float):
+                        gamma = gamma.clamp_(1.0 + s_lo, 1.0 + s_hi)
+                    if isinstance(sh_lo, float) and isinstance(sh_hi, float):
+                        bias = bias.clamp_(sh_lo, sh_hi)
+                except Exception:
+                    pass
+                out = gamma * x + bias
+                return out
+
+            h = _apply_film(h, pre_strength, 'pre')
 
         # 后续保持不变
         h = h + self.block1(h)
         h = h + self.block2(h)
         h = h + self.block3(h)
+
+        if self.use_film and self.film is not None:
+            h = _apply_film(h, post_strength, 'post')
+            # 统计量：alpha/beta与最终scale/bias的均值，便于可视化
+            try:
+                a_mean = float(alpha_cf.mean().item())
+                b_mean = float(beta_cf.mean().item())
+                nan_ratio_alpha = float(max(0.0, 1.0 - torch.isfinite(alpha_cf).float().mean().item()))
+                nan_ratio_beta  = float(max(0.0, 1.0 - torch.isfinite(beta_cf).float().mean().item()))
+            except Exception:
+                a_mean = 0.0
+                b_mean = 0.0
+                nan_ratio_alpha = 0.0
+                nan_ratio_beta = 0.0
+            self._last_film_stats = {
+                'pre': float(pre_strength),
+                'post': float(post_strength),
+                'gain_scale': float(self.film_gain_scale),
+                'bias_scale': float(self.film_bias_scale),
+                'invert': bool(self.film_invert),
+                'ap_blend': float(self.ap_blend if self.use_acoustic_priors else 0.0),
+                'a_mean': a_mean,
+                'b_mean': b_mean,
+                'nan_ratio_alpha': nan_ratio_alpha,
+                'nan_ratio_beta': nan_ratio_beta,
+                'nan_count_alpha': int(nan_count_alpha),
+                'nan_count_beta': int(nan_count_beta),
+            }
+        else:
+            self._last_film_stats = None
         # Three-head synthesis with Stage3 compatibility mode
         mu = self.out_mu(h)                         # [B, d_out, T]
 

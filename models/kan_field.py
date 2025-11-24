@@ -45,6 +45,20 @@ class KANLiteFiLM(nn.Module):
                 batch_first=True,
             )
 
+        # Optional clamp ranges (for downstream modules to enforce gamma/shift bounds)
+        # Semantics: scale clamp applies to gamma-1 (delta), shift clamp applies to beta
+        self._clamp_scale_lo: Optional[float] = None
+        self._clamp_scale_hi: Optional[float] = None
+        self._clamp_shift_lo: Optional[float] = None
+        self._clamp_shift_hi: Optional[float] = None
+
+    # Public utility to set clamp ranges from training script
+    def set_clamp(self, scale_lo: float, scale_hi: float, shift_lo: float, shift_hi: float) -> None:
+        self._clamp_scale_lo = float(scale_lo)
+        self._clamp_scale_hi = float(scale_hi)
+        self._clamp_shift_lo = float(shift_lo)
+        self._clamp_shift_hi = float(shift_hi)
+
     def _expand_temporal(self, params: torch.Tensor, T: int) -> torch.Tensor:
         # —— 防止上游传入二维导致后面 permute 报错 —— #
         if params.dim() == 2:              # [B, D] -> [B, 1, D]
