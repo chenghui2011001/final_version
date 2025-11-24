@@ -2187,14 +2187,15 @@ def train_one_epoch(
             dec_refine_gn = float(max(0.0, dec_refine_sq) ** 0.5)
             dec_other_gn = float(dec_other_sq ** 0.5)
 
-            # Encoder core = all encoder minus film
+            # Encoder core = all encoder minus FiLM
             enc_total_sq = _grad_sq_from_params(actual_enc.parameters())
             enc_core_sq = max(0.0, enc_total_sq - film_sq)
             enc_core_gn = float(enc_core_sq ** 0.5)
-            film_info = getattr(encoder, '_last_film_stats', None)
+            # FiLM 统计始终从实际 encoder 模块（而非 DDP wrapper）读取
+            film_info = getattr(actual_enc, '_last_film_stats', None)
             pre_s = film_info.get('pre_s', 0.0) if isinstance(film_info, dict) else 0.0
             post_s = film_info.get('post_s', 0.0) if isinstance(film_info, dict) else 0.0
-            film_pos = getattr(encoder, 'film_position', 'none')
+            film_pos = getattr(actual_enc, 'film_position', 'none')
             # Channel summary (batch-level) — only for keys present
             snr_mean = None
             ber_mean = None
@@ -2255,9 +2256,9 @@ def train_one_epoch(
             if 'fs' in locals() and fs is not None: ch_post['FS'] = f"{fs:.2f}"
             if 'los' in locals() and los is not None: ch_post['LOS'] = f"{los:.2f}"
 
-            # Decoder-side FiLM stats (safe retrieval)
+            # Decoder-side FiLM stats (safe retrieval，兼容 DDP)
             try:
-                _ref = getattr(decoder, 'refiner', None)
+                _ref = getattr(actual_dec, 'refiner', None)
                 if _ref is not None and hasattr(_ref, 'get_film_stats'):
                     dec_film_info = _ref.get_film_stats() or {}
                 else:
@@ -3356,7 +3357,7 @@ def main() -> int:
         f"decWave_x={getattr(args,'dec_wave_lr_mult',1.0)} wd_film={args.film_wd}"
     )
 
-    # Multi-GPU setup: support both DataParallel and DistributedDataParallel
+        # Multi-GPU setup: support both DataParallel and DistributedDataParallel
     if distributed_training:
         # Use DistributedDataParallel for multi-GPU/multi-node training
         if is_main_process():
@@ -3377,8 +3378,9 @@ def main() -> int:
             find_unused_parameters=True
         )
 
-        # 🔧 设置静态图以避免参数重复标记问题
+        # 🔧 设置静态图以启用 DDP 静态图优化（encoder + decoder）
         try:
+            encoder._set_static_graph()
             decoder._set_static_graph()
         except Exception:
             pass
@@ -3482,30 +3484,33 @@ def main() -> int:
 
         # Update FiLM schedules (encoder + decoder.refiner if available)
         try:
+            # 在DP/DDP环境下始终使用实际模块对象（.module）来设置FiLM调度
+            enc_actual = encoder.module if hasattr(encoder, 'module') else encoder
+            dec_actual = decoder.module if hasattr(decoder, 'module') else decoder
             # Unconditionally set encoder FiLM schedule knobs (AETHEREncoder uses getattr fallback otherwise)
-            setattr(encoder, 'film_pre_warmup', int(args.film_pre_warmup))
-            setattr(encoder, 'film_pre_end', float(args.film_pre_end))
-            setattr(encoder, 'film_post_end', float(args.film_post_end))
-            setattr(encoder, 'film_post_warmup', int(args.film_post_warmup))
+            setattr(enc_actual, 'film_pre_warmup', int(args.film_pre_warmup))
+            setattr(enc_actual, 'film_pre_end', float(args.film_pre_end))
+            setattr(enc_actual, 'film_post_end', float(args.film_post_end))
+            setattr(enc_actual, 'film_post_warmup', int(args.film_post_warmup))
             # Decoder refiner may ignore these if unsupported; safe to attach as attributes for future use
-            if hasattr(decoder, 'refiner'):
-                setattr(decoder.refiner, 'film_pre_warmup', int(args.film_pre_warmup))
-                setattr(decoder.refiner, 'film_pre_end', float(args.film_pre_end))
-                setattr(decoder.refiner, 'film_post_end', float(args.film_post_end))
-                setattr(decoder.refiner, 'film_post_warmup', int(args.film_post_warmup))
+            if hasattr(dec_actual, 'refiner'):
+                setattr(dec_actual.refiner, 'film_pre_warmup', int(args.film_pre_warmup))
+                setattr(dec_actual.refiner, 'film_pre_end', float(args.film_pre_end))
+                setattr(dec_actual.refiner, 'film_post_end', float(args.film_post_end))
+                setattr(dec_actual.refiner, 'film_post_warmup', int(args.film_post_warmup))
             # Print confirmation of FiLM schedules
             try:
                 enc_sched = {
-                    'pre_end': getattr(encoder, 'film_pre_end', None),
-                    'pre_warmup': getattr(encoder, 'film_pre_warmup', None),
-                    'post_end': getattr(encoder, 'film_post_end', None),
-                    'post_warmup': getattr(encoder, 'film_post_warmup', None)
+                    'pre_end': getattr(enc_actual, 'film_pre_end', None),
+                    'pre_warmup': getattr(enc_actual, 'film_pre_warmup', None),
+                    'post_end': getattr(enc_actual, 'film_post_end', None),
+                    'post_warmup': getattr(enc_actual, 'film_post_warmup', None)
                 }
                 dec_sched = {}
-                if hasattr(decoder, 'refiner'):
+                if hasattr(dec_actual, 'refiner'):
                     for k in ['film_pre_end', 'film_pre_warmup', 'film_post_end', 'film_post_warmup']:
-                        if hasattr(decoder.refiner, k):
-                            dec_sched[k] = getattr(decoder.refiner, k)
+                        if hasattr(dec_actual.refiner, k):
+                            dec_sched[k] = getattr(dec_actual.refiner, k)
                 safe_print(f"[FiLM] Schedules: encoder={enc_sched} decoder_refiner={dec_sched}")
             except Exception:
                 pass
