@@ -3377,6 +3377,12 @@ def main() -> int:
             find_unused_parameters=True
         )
 
+        # 🔧 设置静态图以避免参数重复标记问题
+        try:
+            decoder._set_static_graph()
+        except Exception:
+            pass
+
         # 🔥 DDP包装SSL Teacher（仅当有可训练参数时）
         if ssl_teacher is not None:
             # 检查SSL Teacher是否有需要梯度的参数
