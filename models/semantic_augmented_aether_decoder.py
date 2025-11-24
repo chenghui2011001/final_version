@@ -876,19 +876,15 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         if z_sem is not None:
             # 使用传入的潜空间特征直接计算损失
             try:
-                print(f"🔥 使用传入的潜空间特征 z_sem: {z_sem.shape}, SSL特征: {ssl_features.shape}")
-
                 # 🔧 修复时间维度对齐问题
                 T_ssl = ssl_features.shape[1]  # SSL特征的时间维度
                 T_z = z_sem.shape[1]          # z_sem的时间维度
 
                 # 对齐时间维度：下采样音频特征到SSL帧率 (语义级别)
                 if T_z != T_ssl:
-                    print(f"⚠️ 时间维度不匹配: z_sem({T_z}) vs SSL({T_ssl})，进行语义级对齐")
 
                     if abs(T_z - T_ssl * 2) < abs(T_z - T_ssl):
                         # 检测到2倍关系，下采样z_sem到SSL的语义帧率
-                        print(f"🔄 检测到2倍帧率关系，下采样z_sem到语义帧率")
                         z_sem_aligned = F.interpolate(
                             z_sem.transpose(1, 2),  # [B, latent_dim, T_z]
                             size=T_ssl,
@@ -896,22 +892,18 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                             align_corners=False
                         ).transpose(1, 2)  # [B, T_ssl, latent_dim]
                         ssl_features_aligned = ssl_features
-                        print(f"✅ 下采样后: z_sem {z_sem.shape} -> {z_sem_aligned.shape}")
                     elif T_z > T_ssl:
                         # 简单截断：取前T_ssl个时间步
                         z_sem_aligned = z_sem[:, :T_ssl, :]
                         ssl_features_aligned = ssl_features
-                        print(f"🔄 截断z_sem: {z_sem.shape} -> {z_sem_aligned.shape}")
                     else:
                         # SSL更长，截断SSL
                         z_sem_aligned = z_sem
                         ssl_features_aligned = ssl_features[:, :T_z, :]
-                        print(f"🔄 截断SSL: {ssl_features.shape} -> {ssl_features_aligned.shape}")
                 else:
                     z_sem_aligned = z_sem
                     ssl_features_aligned = ssl_features
 
-                print(f"✅ 对齐后: z_sem({z_sem_aligned.shape}) vs SSL({ssl_features_aligned.shape})")
 
                 # 通过LatentSpaceHead计算损失
                 _, sem_loss_tensor, sem_metrics = self.latent_head(
