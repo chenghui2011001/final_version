@@ -1410,7 +1410,7 @@ def train_one_epoch(
                                 # 🔥 获取潜空间特征z_sem用于语义损失计算
                                 z_sem = decoder_outputs.get('z_sem', None)
 
-                                sem_dec_loss, _sem_metrics = decoder.compute_semantic_loss(
+                                sem_dec_loss, sem_metrics = decoder.compute_semantic_loss(
                                     semantic_features,
                                     ssl_feats,
                                     loss_type=sem_loss_type,
@@ -1423,6 +1423,9 @@ def train_one_epoch(
                                     z_sem=z_sem,  # 传递潜空间特征
                                 )
                                 semantic_loss = sem_dec_loss * sem_scale
+
+                                # 🔥 保存语义指标供wandb记录使用
+                                train_one_epoch._sem_metrics = sem_metrics
                             except Exception as _se:
                                 print(f"⚠️ decoder-side semantic loss failed: {_se}")
                                 # 回退到简单的cosine对齐（使用语义提取器）
@@ -2353,6 +2356,8 @@ def train_one_epoch(
                     'loss/acoustic_total': float(acoustic_loss.item()),
                     'loss/semantic': float(semantic_loss.item()),
                     'loss/semantic_total': float(semantic_loss.item()),
+                    # 🔥 潜空间语义损失的单独记录（原始损失，未经schedule缩放）
+                    'semantic/latent_sem_loss': float(getattr(train_one_epoch, '_sem_metrics', {}).get('latent_sem_loss', 0.0)),
                     # Day1: GAN 相关
                     'loss/adv': float(adv_loss.item()) if torch.is_tensor(adv_loss) else float(adv_loss),
                     'loss/fmap': float(fm_loss.item()) if torch.is_tensor(fm_loss) else float(fm_loss),

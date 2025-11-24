@@ -921,7 +921,9 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 )
 
                 base_loss = sem_loss_tensor
-                base_metrics = sem_metrics
+                base_metrics = sem_metrics.copy()
+                # 🔥 单独记录潜空间语义损失，用于与总语义损失对比
+                base_metrics['latent_sem_loss'] = sem_loss_tensor.item()
                 print(f"✅ 潜空间语义损失: {base_loss.item():.6f}")
 
             except Exception as e:
@@ -957,7 +959,9 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
                 )
 
                 base_loss = sem_loss_tensor
-                base_metrics = sem_metrics
+                base_metrics = sem_metrics.copy()
+                # 🔥 单独记录潜空间语义损失，用于与总语义损失对比
+                base_metrics['latent_sem_loss'] = sem_loss_tensor.item()
                 print(f"✅ 重新生成的潜空间语义损失: {base_loss.item():.6f}")
 
             except Exception as e:
