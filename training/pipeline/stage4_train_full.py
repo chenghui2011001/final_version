@@ -1428,13 +1428,38 @@ def train_one_epoch(
                                 train_one_epoch._sem_metrics = sem_metrics
                             except Exception as _se:
                                 print(f"⚠️ decoder-side semantic loss failed: {_se}")
+                                # 🔥 详细调试信息：捕获多GPU下语义损失计算异常
+                                import traceback
+                                print(f"🔍 Multi-GPU Debug - Exception Type: {type(_se).__name__}")
+                                print(f"🔍 Multi-GPU Debug - Exception Details: {str(_se)}")
+                                print(f"🔍 Multi-GPU Debug - Stack Trace: {traceback.format_exc()}")
+
+                                # 检查关键变量状态
+                                print(f"🔍 Multi-GPU Debug - semantic_features shape: {semantic_features.shape if semantic_features is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - ssl_feats shape: {ssl_feats.shape if ssl_feats is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - audio shape: {audio.shape if audio is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - z_sem shape: {decoder_outputs.get('z_sem', None).shape if decoder_outputs.get('z_sem', None) is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - decoder device: {next(decoder.parameters()).device}")
+                                print(f"🔍 Multi-GPU Debug - semantic_features device: {semantic_features.device if semantic_features is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - ssl_feats device: {ssl_feats.device if ssl_feats is not None else None}")
+                                print(f"🔍 Multi-GPU Debug - audio device: {audio.device if audio is not None else None}")
+
                                 # 回退到简单的cosine对齐（使用语义提取器）
+                                print("🔧 Multi-GPU Debug - Falling back to simple cosine alignment")
                                 if sem_ext is not None:
-                                    with torch.no_grad():
-                                        sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))
-                                    sp = F.normalize(semantic_features.float(), dim=-1)
-                                    st = F.normalize(sem_tgt.float(), dim=-1)
-                                    semantic_loss = (1.0 - (sp * st).sum(dim=-1).mean()) * sem_scale
+                                    try:
+                                        with torch.no_grad():
+                                            sem_tgt = sem_ext(audio.detach(), target_frames=semantic_features.size(1))
+                                        sp = F.normalize(semantic_features.float(), dim=-1)
+                                        st = F.normalize(sem_tgt.float(), dim=-1)
+                                        semantic_loss = (1.0 - (sp * st).sum(dim=-1).mean()) * sem_scale
+                                        print(f"✅ Multi-GPU Debug - Fallback semantic_loss: {semantic_loss.item():.6f}")
+                                    except Exception as fallback_e:
+                                        print(f"❌ Multi-GPU Debug - Fallback also failed: {fallback_e}")
+                                        semantic_loss = torch.tensor(0.0, device=device)
+                                else:
+                                    print("❌ Multi-GPU Debug - sem_ext is None, cannot compute fallback")
+                                    semantic_loss = torch.tensor(0.0, device=device)
 
                         else:
                             # Stage3风格Teacher：使用16维语义提取器
