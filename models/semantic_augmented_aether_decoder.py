@@ -852,7 +852,9 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
         wave_semantic_weight: float = 0.3,
         # 20维→16维蒸馏参数
         acoustic_semantic_distill: Optional[torch.Tensor] = None,
-        distill_weight: float = 0.5
+        distill_weight: float = 0.5,
+        # 🔥 新增：潜空间特征参数
+        z_sem: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """计算语义对齐损失（使用新的LatentSpaceHead）"""
         if not self.enable_semantic_augmentation or self.latent_head is None:
@@ -861,13 +863,119 @@ class SemanticAugmentedAETHERDecoder(AETHERDecoder):
             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
             return zero_loss, {"semantic_disabled": 1.0}
 
-        # 使用新的LatentSpaceHead计算基础语义损失
-        # 注意：这里需要从z_sem重新计算，但我们直接使用已有的semantic_features
-        # 创建一个dummy z_sem来调用LatentSpaceHead
-        dummy_z_sem = torch.randn_like(semantic_features).unsqueeze(-1).expand(-1, -1, self.latent_head.latent_dim)
-        base_loss, base_metrics = self.latent_head(
-            dummy_z_sem, ssl_features
-        )[1:3]  # 只取loss和metrics
+        # 🔥 使用潜空间特征z_sem计算语义损失
+
+        # 处理semantic_features维度
+        B, T = semantic_features.shape[:2]
+        if semantic_features.dim() == 4:
+            semantic_features_2d = semantic_features.squeeze(-1)  # [B, T, 16]
+        else:
+            semantic_features_2d = semantic_features
+
+        # 优先使用传入的z_sem，如果没有则尝试重新生成
+        if z_sem is not None:
+            # 使用传入的潜空间特征直接计算损失
+            try:
+                print(f"🔥 使用传入的潜空间特征 z_sem: {z_sem.shape}, SSL特征: {ssl_features.shape}")
+
+                # 🔧 修复时间维度对齐问题
+                T_ssl = ssl_features.shape[1]  # SSL特征的时间维度
+                T_z = z_sem.shape[1]          # z_sem的时间维度
+
+                # 对齐时间维度：下采样音频特征到SSL帧率 (语义级别)
+                if T_z != T_ssl:
+                    print(f"⚠️ 时间维度不匹配: z_sem({T_z}) vs SSL({T_ssl})，进行语义级对齐")
+
+                    if abs(T_z - T_ssl * 2) < abs(T_z - T_ssl):
+                        # 检测到2倍关系，下采样z_sem到SSL的语义帧率
+                        print(f"🔄 检测到2倍帧率关系，下采样z_sem到语义帧率")
+                        z_sem_aligned = F.interpolate(
+                            z_sem.transpose(1, 2),  # [B, latent_dim, T_z]
+                            size=T_ssl,
+                            mode='linear',
+                            align_corners=False
+                        ).transpose(1, 2)  # [B, T_ssl, latent_dim]
+                        ssl_features_aligned = ssl_features
+                        print(f"✅ 下采样后: z_sem {z_sem.shape} -> {z_sem_aligned.shape}")
+                    elif T_z > T_ssl:
+                        # 简单截断：取前T_ssl个时间步
+                        z_sem_aligned = z_sem[:, :T_ssl, :]
+                        ssl_features_aligned = ssl_features
+                        print(f"🔄 截断z_sem: {z_sem.shape} -> {z_sem_aligned.shape}")
+                    else:
+                        # SSL更长，截断SSL
+                        z_sem_aligned = z_sem
+                        ssl_features_aligned = ssl_features[:, :T_z, :]
+                        print(f"🔄 截断SSL: {ssl_features.shape} -> {ssl_features_aligned.shape}")
+                else:
+                    z_sem_aligned = z_sem
+                    ssl_features_aligned = ssl_features
+
+                print(f"✅ 对齐后: z_sem({z_sem_aligned.shape}) vs SSL({ssl_features_aligned.shape})")
+
+                # 通过LatentSpaceHead计算损失
+                _, sem_loss_tensor, sem_metrics = self.latent_head(
+                    z_sem_aligned,  # [B, T_aligned, latent_dim]
+                    teacher_features=ssl_features_aligned,  # [B, T_aligned, ssl_dim]
+                    mask=None,
+                )
+
+                base_loss = sem_loss_tensor
+                base_metrics = sem_metrics
+                print(f"✅ 潜空间语义损失: {base_loss.item():.6f}")
+
+            except Exception as e:
+                print(f"⚠️ 使用传入z_sem计算损失失败: {e}")
+                # 回退到简单损失，确保维度对齐
+                T_min = min(semantic_features_2d.shape[1], ssl_features.shape[1])
+                semantic_aligned = semantic_features_2d[:, :T_min, :]
+                ssl_aligned = ssl_features[:, :T_min, :semantic_aligned.shape[-1]]
+                base_loss = F.mse_loss(semantic_aligned, ssl_aligned)
+                base_metrics = {"fallback_mse": base_loss.item()}
+
+        elif hasattr(self, 'semantic_adapter') and self.semantic_adapter is not None:
+            # 如果没有传入z_sem，尝试重新生成
+            try:
+                print("🔄 重新生成潜空间特征 z_sem")
+
+                # 确保时间维度对齐
+                T_min = min(semantic_features_2d.shape[1], ssl_features.shape[1])
+                semantic_aligned = semantic_features_2d[:, :T_min, :]
+                ssl_aligned = ssl_features[:, :T_min, :]
+
+                z_sem_generated, adapter_logs = self.semantic_adapter(
+                    semantic_aligned,  # [B, T_min, 16] 作为semantic_raw
+                    teacher_features=ssl_aligned,  # SSL features
+                    mask=None,
+                )
+
+                # 通过LatentSpaceHead计算损失
+                _, sem_loss_tensor, sem_metrics = self.latent_head(
+                    z_sem_generated,  # [B, T_min, latent_dim]
+                    teacher_features=ssl_aligned,
+                    mask=None,
+                )
+
+                base_loss = sem_loss_tensor
+                base_metrics = sem_metrics
+                print(f"✅ 重新生成的潜空间语义损失: {base_loss.item():.6f}")
+
+            except Exception as e:
+                print(f"⚠️ 重新生成z_sem计算损失失败: {e}")
+                # 回退到简单损失
+                T_min = min(semantic_features_2d.shape[1], ssl_features.shape[1])
+                semantic_aligned = semantic_features_2d[:, :T_min, :]
+                ssl_aligned = ssl_features[:, :T_min, :semantic_aligned.shape[-1]]
+                base_loss = F.mse_loss(semantic_aligned, ssl_aligned)
+                base_metrics = {"fallback_mse": base_loss.item()}
+        else:
+            print("⚠️ semantic_adapter未初始化且未传入z_sem，使用简单对齐损失")
+            # 回退到简单的特征对齐，确保维度对齐
+            T_min = min(semantic_features_2d.shape[1], ssl_features.shape[1])
+            semantic_aligned = semantic_features_2d[:, :T_min, :]
+            ssl_aligned = ssl_features[:, :T_min, :semantic_aligned.shape[-1]]
+            base_loss = F.mse_loss(semantic_aligned, ssl_aligned)
+            base_metrics = {"simple_mse": base_loss.item()}
 
         total_loss = base_loss
         total_metrics = base_metrics.copy()

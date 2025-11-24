@@ -1406,6 +1406,9 @@ def train_one_epoch(
                                 # 20→16蒸馏特征（若存在）
                                 distill_feat = decoder_outputs.get('acoustic_semantic_distill', None)
 
+                                # 🔥 获取潜空间特征z_sem用于语义损失计算
+                                z_sem = decoder_outputs.get('z_sem', None)
+
                                 sem_dec_loss, _sem_metrics = decoder.compute_semantic_loss(
                                     semantic_features,
                                     ssl_feats,
@@ -1416,6 +1419,7 @@ def train_one_epoch(
                                     wave_semantic_weight=wwave,
                                     acoustic_semantic_distill=distill_feat,
                                     distill_weight=wdist,
+                                    z_sem=z_sem,  # 传递潜空间特征
                                 )
                                 semantic_loss = sem_dec_loss * sem_scale
                             except Exception as _se:
@@ -3022,8 +3026,19 @@ def main() -> int:
         pass
 
     # 创建解码器：根据参数选择语义增强或传统解码器
-    # Baseline: 强制使用传统 AETHER-FARGAN 解码器，暂不启用语义增强路径
-    enable_semantic = False
+    # 🔥 强制启用语义增强解码器当语义参数存在时
+    enable_semantic = (
+        getattr(args, 'enable_semantic_augmentation', False) or
+        getattr(args, 'enable_semantic_fusion', False) or
+        (hasattr(args, 'ssl_model') and args.ssl_model is not None)
+    )
+
+    # 调试输出
+    safe_print(f"🔍 Debug semantic enable logic:")
+    safe_print(f"  - enable_semantic_augmentation: {getattr(args, 'enable_semantic_augmentation', False)}")
+    safe_print(f"  - enable_semantic_fusion: {getattr(args, 'enable_semantic_fusion', False)}")
+    safe_print(f"  - ssl_model: {getattr(args, 'ssl_model', None)}")
+    safe_print(f"  - enable_semantic: {enable_semantic}")
 
     if enable_semantic:
         from models.semantic_augmented_aether_decoder import SemanticAugmentedAETHERDecoder
@@ -3494,8 +3509,22 @@ def main() -> int:
         # 设置双头解码器和语义Teacher相关的标志
         setattr(train_one_epoch, '_use_dual_head', args.use_dual_head_decoder)
         # 训练期可用的语义teacher/提取器/权重设置
-        setattr(train_one_epoch, '_ssl_teacher', ssl_teacher if (args.use_dual_head_decoder and 'ssl_teacher' in locals()) else None)
+        # 🔧 修复：检查语义增强是否启用，而不仅仅是dual_head
+        semantic_enabled = (
+            args.use_dual_head_decoder or
+            getattr(args, 'enable_semantic_augmentation', False) or
+            enable_semantic
+        )
+        setattr(train_one_epoch, '_ssl_teacher', ssl_teacher if (semantic_enabled and 'ssl_teacher' in locals()) else None)
         setattr(train_one_epoch, '_semantic_extractor', semantic_extractor if 'semantic_extractor' in locals() else None)
+
+        # 调试输出
+        safe_print(f"🔍 Debug train_one_epoch teacher setup:")
+        safe_print(f"  - semantic_enabled: {semantic_enabled}")
+        safe_print(f"  - ssl_teacher in locals: {'ssl_teacher' in locals()}")
+        safe_print(f"  - ssl_teacher is None: {ssl_teacher is None}")
+        safe_print(f"  - _ssl_teacher set to: {getattr(train_one_epoch, '_ssl_teacher', 'NOT_SET')}")
+        safe_print(f"  - semantic_teacher: {args.semantic_teacher}")
         setattr(train_one_epoch, '_fusion_reg_weight', getattr(args, 'fusion_reg_weight', 0.1))  # 增加融合正则权重
         setattr(train_one_epoch, '_alpha_acoustic', float(args.alpha_acoustic))
         setattr(train_one_epoch, '_alpha_semantic', float(args.alpha_semantic))
